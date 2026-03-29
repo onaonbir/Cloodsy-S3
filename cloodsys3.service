@@ -1,0 +1,22 @@
+[Unit]
+Description=Cloodsy S3 Server
+After=network.target
+
+[Service]
+Type=simple
+User=cloodsys3
+Group=cloodsys3
+WorkingDirectory=/opt/cloodsys3
+ExecStart=/opt/cloodsys3/cloodsys3 serve -config /opt/cloodsys3/config.yaml
+Restart=always
+RestartSec=5
+LimitNOFILE=65535
+
+# Security hardening
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/cloodsys3
+
+[Install]
+WantedBy=multi-user.target

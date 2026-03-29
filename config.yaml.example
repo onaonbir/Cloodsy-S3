@@ -1,0 +1,33 @@
+# Cloodsy S3 - Configuration File
+# Copy this file and pass with: cloodsys3 serve -config config.yaml
+# All values below are defaults - only override what you need.
+
+server:
+  listen: ":9000"              # Dinlenecek adres ve port
+  region: "us-east-1"          # S3 region adi (SigV4 imzalamada kullanilir)
+  tls:
+    enabled: false
+    cert_file: ""              # TLS sertifika dosyasi yolu
+    key_file: ""               # TLS private key dosyasi yolu
+
+database:
+  path: "./.cloodsys3/cloodsys3.db"   # SQLite veritabani dosyasi
+  busy_timeout: 5000                   # SQLite busy timeout (ms) - yazma kilidi bekleme suresi
+  cache_size: 64000                    # SQLite page cache boyutu (KB)
+  mmap_size: 134217728                 # SQLite memory-mapped I/O boyutu (bytes, 128MB)
+  max_readers: 4                       # Paralel okuma baglanti sayisi
+
+storage:
+  root_dir: "./.cloodsys3/data"        # Obje dosyalarinin saklanacagi kok dizin
+  multipart_max_age: "24h"             # Tamamlanmamis multipart upload temizleme suresi
+  lifecycle_interval: "1h"             # Lifecycle rule kontrol araligi
+
+logging:
+  level: "info"                # Log seviyesi: debug, info, warn, error
+  format: "text"               # Log formati: text veya json
+
+admin:
+  enabled: false               # Admin API'yi etkinlestir (Flutter GUI icin)
+  listen: ":9001"              # Admin API portu (S3 API'den ayri)
+  cors_origins:                # Flutter web icin izin verilen origin'ler
+    - "*"

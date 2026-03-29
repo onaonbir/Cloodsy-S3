@@ -1,0 +1,90 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.24'
+
+      - name: Get version from tag
+        id: version
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+
+      - name: Build all platforms
+        env:
+          VERSION: ${{ steps.version.outputs.VERSION }}
+          COMMIT: ${{ github.sha }}
+          BUILD_DATE: ${{ github.event.head_commit.timestamp }}
+        run: |
+          LDFLAGS="-s -w -X 'main.Version=${VERSION}' -X 'main.CommitHash=${COMMIT:0:7}' -X 'main.BuildDate=${BUILD_DATE}'"
+          mkdir -p dist
+
+          echo "Building Linux amd64..."
+          GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-amd64 .
+
+          echo "Building Linux arm64 (Raspberry Pi)..."
+          GOOS=linux GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-arm64 .
+
+          echo "Building Linux armv7..."
+          GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-armv7 .
+
+          echo "Building Windows amd64..."
+          GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-windows-amd64.exe .
+
+          echo "Building macOS arm64 (Apple Silicon)..."
+          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-darwin-arm64 .
+
+          echo "Building macOS amd64 (Intel)..."
+          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-darwin-amd64 .
+
+          echo "All builds complete."
+          ls -lh dist/
+
+      - name: Create archives
+        run: |
+          cd dist
+
+          # Linux & macOS — tar.gz
+          for f in cloodsys3-linux-amd64 cloodsys3-linux-arm64 cloodsys3-linux-armv7 cloodsys3-darwin-arm64 cloodsys3-darwin-amd64; do
+            tar czf "${f}.tar.gz" "${f}"
+          done
+
+          # Windows — zip
+          zip cloodsys3-windows-amd64.zip cloodsys3-windows-amd64.exe
+
+          # Checksums
+          sha256sum *.tar.gz *.zip > checksums.txt
+
+          echo "Archives:"
+          ls -lh *.tar.gz *.zip checksums.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: "Cloodsy S3 v${{ steps.version.outputs.VERSION }}"
+          generate_release_notes: true
+          files: |
+            dist/cloodsys3-linux-amd64.tar.gz
+            dist/cloodsys3-linux-arm64.tar.gz
+            dist/cloodsys3-linux-armv7.tar.gz
+            dist/cloodsys3-windows-amd64.zip
+            dist/cloodsys3-darwin-arm64.tar.gz
+            dist/cloodsys3-darwin-amd64.tar.gz
+            dist/checksums.txt
