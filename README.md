@@ -650,7 +650,12 @@ make version          # Print current version
 
 ## License
 
-See [LICENSE](LICENSE) for details.
+Cloodsy S3 is source-available under the [Cloodsy S3 Community License 1.0](LICENSE).
+
+You can use it freely for personal, internal, educational, and self-hosted purposes.
+Commercial resale, SaaS offerings, and competing hosted services require a separate commercial license.
+
+Contact: [trademark@onaonbir.com](mailto:trademark@onaonbir.com)
 
 ---
 

@@ -1,0 +1,81 @@
+# Cloodsy S3 Community License 1.0
+
+Copyright (c) 2026 OnaOnbir
+
+## 1. Purpose
+
+This license allows anyone to view, use, modify, and distribute the source code of Cloodsy S3 for personal, educational, internal business, development, testing, and evaluation purposes.
+
+However, commercial redistribution, resale, hosted service offerings, and competing commercial products based on Cloodsy S3 are restricted unless explicit written permission is granted by OnaOnbir.
+
+## 2. Allowed Uses
+
+You may:
+
+* Use the software for personal projects
+* Use the software internally within your company or organization
+* Use the software for development, testing, research, and evaluation
+* Modify the source code for your own needs
+* Distribute modified or unmodified copies for non-commercial purposes
+* Deploy the software for internal infrastructure use
+* Use the software in production for your own workloads
+
+## 3. Restricted Uses
+
+You may not, without prior written permission from OnaOnbir:
+
+* Sell the software
+* Offer the software as a hosted or managed service to third parties
+* Repackage the software under another brand for resale
+* Include the software in a paid commercial product where Cloodsy S3 is a primary feature
+* Compete directly with Cloodsy S3 by offering an S3-compatible storage service based substantially on this software
+* Sell support, consulting, or commercial hosting services specifically around unmodified or lightly modified copies of the software
+* Remove or alter copyright, attribution, or branding notices
+
+Examples of restricted use include:
+
+* Offering "Cloodsy S3 Hosting" to customers
+* Embedding Cloodsy S3 into a commercial NAS, backup appliance, or SaaS platform sold to customers
+* Running a public object storage platform based on Cloodsy S3 where customers pay for access
+* Forking the project and selling it under a different name
+
+## 4. Redistribution Requirements
+
+If you distribute the software or modified versions of it, you must:
+
+* Include this license file
+* Clearly state that changes were made
+* Retain all copyright notices
+* Retain all attribution to OnaOnbir and Cloodsy S3
+* Not imply endorsement by OnaOnbir
+
+## 5. Future Open Source Conversion
+
+Each version of Cloodsy S3 released under this license will automatically convert to the GNU General Public License v3.0 exactly 4 years after the public release date of that version.
+
+After the conversion date, that version may be used under GPL v3 terms instead of this license. Newer versions released after the conversion remain under this license until their own 4-year period expires.
+
+## 6. Trademark
+
+The names "Cloodsy S3", "OnaOnbir", related logos, and branding are not licensed under this agreement.
+
+You may not use the project name, logo, or branding in a way that suggests official partnership, endorsement, or ownership.
+
+## 7. Warranty Disclaimer
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A PARTICULAR PURPOSE, AND NON-INFRINGEMENT.
+
+IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES, DATA LOSS, OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT, OR OTHERWISE, ARISING FROM, OUT OF, OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+## 8. Commercial Licensing
+
+If you want to:
+
+* Offer hosted Cloodsy S3 services
+* Bundle Cloodsy S3 into a paid product
+* Resell or redistribute it commercially
+* Use it in a competing commercial offering
+
+You must obtain a separate commercial license from OnaOnbir.
+
+Contact: [trademark@onaonbir.com](mailto:trademark@onaonbir.com)
