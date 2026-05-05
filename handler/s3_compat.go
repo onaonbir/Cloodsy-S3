@@ -105,11 +105,16 @@ func (h *Handler) ListParts(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	_ = bucket
 
 	uploadID := r.URL.Query().Get("uploadId")
 	upload, err := h.DB.GetMultipartUpload(uploadID)
 	if err != nil || upload == nil {
+		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
+		return
+	}
+
+	// Validate upload belongs to the requested bucket (prevent cross-bucket hijacking)
+	if upload.BucketID != bucket.ID {
 		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
 		return
 	}
@@ -298,7 +303,7 @@ func (h *Handler) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
+	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
 	if !ok {
 		return
 	}
@@ -308,6 +313,18 @@ func (h *Handler) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 	partNumber, err := strconv.Atoi(partNumberStr)
 	if err != nil || partNumber < 1 || partNumber > maxParts {
 		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+		return
+	}
+
+	// Validate the upload belongs to this bucket before staging any data.
+	upload, err := h.DB.GetMultipartUpload(uploadID)
+	if err != nil {
+		h.Logger.Error("db error", "error", err)
+		s3err.WriteError(w, r, s3err.ErrInternalError)
+		return
+	}
+	if upload == nil || upload.BucketID != bucket.ID {
+		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
 		return
 	}
 
@@ -352,7 +369,7 @@ func (h *Handler) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Write as multipart part
-	size, etag, err := h.Storage.PutMultipartPart(uploadID, partNumber, srcReader)
+	size, etag, err := h.Storage.PutMultipartPart(bucketName, uploadID, partNumber, srcReader)
 	reader.Close()
 	if err != nil {
 		h.Logger.Error("upload part copy error", "error", err)

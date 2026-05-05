@@ -113,6 +113,12 @@ func RunBucketDelete(database *db.DB, name, storageRoot string) error {
 	storagePath := filepath.Join(base, name)
 	os.RemoveAll(storagePath)
 
+	// Also wipe the sibling multipart staging tree so abandoned parts don't
+	// linger on disk. DB rows for active uploads are cascade-deleted along
+	// with the bucket; this just cleans the matching files.
+	multipartPath := filepath.Join(base, "."+name+"-multipart")
+	os.RemoveAll(multipartPath)
+
 	pterm.Success.Printfln("Bucket '%s' deleted.", name)
 	return nil
 }
@@ -171,6 +177,17 @@ func RunBucketStorageDir(database *db.DB, name, storageRoot, newDir string) erro
 
 	// Remove old directory (now empty)
 	os.RemoveAll(oldPath)
+
+	// Move the sibling multipart staging tree, if any, so cleanup keeps finding it.
+	oldMultipart := filepath.Join(oldBase, "."+name+"-multipart")
+	newMultipart := filepath.Join(newBase, "."+name+"-multipart")
+	if oldMultipart != newMultipart {
+		if _, err := os.Stat(oldMultipart); err == nil {
+			if err := os.Rename(oldMultipart, newMultipart); err != nil {
+				return fmt.Errorf("move multipart staging: %w", err)
+			}
+		}
+	}
 
 	// Update DB
 	if err := database.SetBucketStorageDir(name, newDir); err != nil {

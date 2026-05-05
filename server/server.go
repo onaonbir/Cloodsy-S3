@@ -83,7 +83,7 @@ func Run(cfg *config.Config, h *handler.Handler, logger *slog.Logger) error {
 
 // multipartCleaner is the subset of storage.Backend needed for cleanup.
 type multipartCleaner interface {
-	DeleteMultipartParts(uploadID string) error
+	DeleteMultipartParts(bucket, uploadID string) error
 }
 
 // runMultipartCleanup periodically removes stale multipart uploads.
@@ -115,10 +115,32 @@ func cleanStaleUploads(database *db.DB, store multipartCleaner, maxAge time.Dura
 		return
 	}
 
+	// Cache bucket-id -> name lookups; many stale uploads typically share buckets.
+	bucketNames := make(map[int64]string)
+
 	cleaned := 0
 	for _, u := range uploads {
-		if err := store.DeleteMultipartParts(u.ID); err != nil {
-			logger.Error("failed to delete stale multipart parts", "uploadId", u.ID, "error", err)
+		name, ok := bucketNames[u.BucketID]
+		if !ok {
+			n, err := database.GetBucketNameByID(u.BucketID)
+			if err != nil {
+				logger.Error("failed to resolve bucket for stale upload", "uploadId", u.ID, "bucketId", u.BucketID, "error", err)
+				continue
+			}
+			if n == "" {
+				// Bucket already gone (cascade deleted); just drop the DB row.
+				if err := database.DeleteMultipartUpload(u.ID); err != nil {
+					logger.Error("failed to delete stale multipart record", "uploadId", u.ID, "error", err)
+					continue
+				}
+				cleaned++
+				continue
+			}
+			bucketNames[u.BucketID] = n
+			name = n
+		}
+		if err := store.DeleteMultipartParts(name, u.ID); err != nil {
+			logger.Error("failed to delete stale multipart parts", "uploadId", u.ID, "bucket", name, "error", err)
 			continue
 		}
 		if err := database.DeleteMultipartUpload(u.ID); err != nil {

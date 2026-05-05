@@ -113,7 +113,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 
 	// Write part data (decode aws-chunked if needed) with size limit
 	body := io.LimitReader(getRequestBody(r), maxPartSize+1)
-	size, etag, err := h.Storage.PutMultipartPart(uploadID, partNumber, body)
+	size, etag, err := h.Storage.PutMultipartPart(bucketName, uploadID, partNumber, body)
 	if err != nil {
 		h.Logger.Error("failed to write part", "error", err)
 		s3err.WriteError(w, r, s3err.ErrInternalError)
@@ -122,7 +122,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 
 	// Check size limit; clean up oversized part
 	if size > maxPartSize {
-		h.Storage.DeleteMultipartParts(uploadID)
+		h.Storage.DeleteMultipartParts(bucketName, uploadID)
 		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
 		return
 	}
@@ -304,7 +304,7 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 	}
 
 	// Clean up multipart data
-	if err := h.Storage.DeleteMultipartParts(uploadID); err != nil {
+	if err := h.Storage.DeleteMultipartParts(bucketName, uploadID); err != nil {
 		h.Logger.Error("failed to clean up multipart parts", "uploadId", uploadID, "error", err)
 	}
 	h.DB.DeleteMultipartUpload(uploadID)
@@ -374,7 +374,7 @@ func (h *Handler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Clean up
-	h.Storage.DeleteMultipartParts(uploadID)
+	h.Storage.DeleteMultipartParts(bucketName, uploadID)
 	h.DB.DeleteMultipartUpload(uploadID)
 
 	w.WriteHeader(http.StatusNoContent)

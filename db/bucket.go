@@ -48,6 +48,17 @@ func (d *DB) GetBucket(name string) (*Bucket, error) {
 	return b, err
 }
 
+// GetBucketNameByID returns just the bucket name for an id. Used by the multipart
+// cleaner where the full bucket struct is unnecessary.
+func (d *DB) GetBucketNameByID(id int64) (string, error) {
+	var name string
+	err := d.reader.QueryRow("SELECT name FROM buckets WHERE id = ?", id).Scan(&name)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return name, err
+}
+
 func (d *DB) GetBucketByID(id int64) (*Bucket, error) {
 	b := &Bucket{}
 	err := d.reader.QueryRow("SELECT id, name, quota_bytes, versioning, storage_dir, created_at FROM buckets WHERE id = ?", id).

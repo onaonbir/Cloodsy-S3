@@ -205,6 +205,10 @@ func (fs *FileSystem) DeleteBucketDir(bucket string) error {
 		return fmt.Errorf("invalid bucket path: %w", err)
 	}
 	err = os.RemoveAll(dir)
+	// Also nuke the sibling multipart staging tree so abandoned parts don't linger.
+	if mpDir, mpErr := fs.multipartBucketDir(bucket); mpErr == nil {
+		os.RemoveAll(mpDir)
+	}
 	fs.RemoveBucketDir(bucket)
 	return err
 }
@@ -245,19 +249,41 @@ func (fs *FileSystem) DeletePrefix(bucket, prefix string) error {
 // validUUID matches a standard UUID format.
 var validUUID = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 
-func (fs *FileSystem) multipartDir(uploadID string) (string, error) {
+// multipartDir returns the staging directory for a multipart upload. Parts are
+// stored as a sibling directory of the bucket data directory under the bucket's
+// effective base path: <bucketBase>/.<bucket>-multipart/<uploadID>/. This keeps
+// multipart traffic on the same volume the bucket is configured to use.
+func (fs *FileSystem) multipartDir(bucket, uploadID string) (string, error) {
+	if bucket == "" {
+		return "", fmt.Errorf("bucket is required")
+	}
 	if !validUUID.MatchString(uploadID) {
 		return "", fmt.Errorf("invalid upload ID format")
 	}
-	dir, err := safePath(fs.RootDir, filepath.Join(".multipart", uploadID))
+	base := fs.bucketBasePath(bucket)
+	dir, err := safePath(base, filepath.Join("."+bucket+"-multipart", uploadID))
 	if err != nil {
 		return "", fmt.Errorf("invalid multipart path: %w", err)
 	}
 	return dir, nil
 }
 
-func (fs *FileSystem) PutMultipartPart(uploadID string, partNumber int, reader io.Reader) (int64, string, error) {
-	dir, err := fs.multipartDir(uploadID)
+// multipartBucketDir returns the per-bucket staging root (without an uploadID).
+// Used for bulk cleanup when a bucket is being deleted.
+func (fs *FileSystem) multipartBucketDir(bucket string) (string, error) {
+	if bucket == "" {
+		return "", fmt.Errorf("bucket is required")
+	}
+	base := fs.bucketBasePath(bucket)
+	dir, err := safePath(base, "."+bucket+"-multipart")
+	if err != nil {
+		return "", fmt.Errorf("invalid multipart path: %w", err)
+	}
+	return dir, nil
+}
+
+func (fs *FileSystem) PutMultipartPart(bucket, uploadID string, partNumber int, reader io.Reader) (int64, string, error) {
+	dir, err := fs.multipartDir(bucket, uploadID)
 	if err != nil {
 		return 0, "", err
 	}
@@ -312,7 +338,7 @@ func (fs *FileSystem) AssembleMultipartParts(bucket, key, uploadID string, partN
 
 	hash := md5.New()
 	var totalSize int64
-	dir, err := fs.multipartDir(uploadID)
+	dir, err := fs.multipartDir(bucket, uploadID)
 	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
@@ -437,7 +463,7 @@ func (fs *FileSystem) AssembleMultipartPartsVersioned(bucket, key, versionID, up
 
 	hash := md5.New()
 	var totalSize int64
-	dir, err := fs.multipartDir(uploadID)
+	dir, err := fs.multipartDir(bucket, uploadID)
 	if err != nil {
 		tmpFile.Close()
 		os.Remove(tmpPath)
@@ -472,8 +498,27 @@ func (fs *FileSystem) AssembleMultipartPartsVersioned(bucket, key, versionID, up
 	return totalSize, etag, nil
 }
 
-func (fs *FileSystem) DeleteMultipartParts(uploadID string) error {
-	dir, err := fs.multipartDir(uploadID)
+func (fs *FileSystem) DeleteMultipartParts(bucket, uploadID string) error {
+	dir, err := fs.multipartDir(bucket, uploadID)
+	if err != nil {
+		return err
+	}
+	if err := os.RemoveAll(dir); err != nil {
+		return err
+	}
+	// Best-effort: remove the per-bucket staging root if it became empty.
+	if parent, err := fs.multipartBucketDir(bucket); err == nil {
+		if entries, err := os.ReadDir(parent); err == nil && len(entries) == 0 {
+			os.Remove(parent)
+		}
+	}
+	return nil
+}
+
+// DeleteAllMultipartForBucket removes the entire .<bucket>-multipart staging tree.
+// Called when a bucket is being deleted so that orphan parts don't linger on disk.
+func (fs *FileSystem) DeleteAllMultipartForBucket(bucket string) error {
+	dir, err := fs.multipartBucketDir(bucket)
 	if err != nil {
 		return err
 	}

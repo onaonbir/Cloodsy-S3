@@ -22,14 +22,16 @@ type Backend interface {
 	// DeleteBucketDir deletes the bucket directory (must be empty).
 	DeleteBucketDir(bucket string) error
 
-	// PutMultipartPart writes a multipart part.
-	PutMultipartPart(uploadID string, partNumber int, reader io.Reader) (int64, string, error)
+	// PutMultipartPart writes a multipart part. Parts are staged under the bucket's
+	// effective base path (sibling to the bucket directory) so custom storage_dir
+	// settings apply to multipart staging as well.
+	PutMultipartPart(bucket, uploadID string, partNumber int, reader io.Reader) (int64, string, error)
 
 	// AssembleMultipartParts combines parts into the final object. Returns total size and ETag.
 	AssembleMultipartParts(bucket, key, uploadID string, partNumbers []int) (int64, string, error)
 
 	// DeleteMultipartParts removes the staging directory for an upload.
-	DeleteMultipartParts(uploadID string) error
+	DeleteMultipartParts(bucket, uploadID string) error
 
 	// Versioned object operations
 	PutVersionedObject(bucket, key, versionID string, reader io.Reader) (int64, string, error)
