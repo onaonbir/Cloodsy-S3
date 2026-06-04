@@ -16,6 +16,7 @@ import (
 	"github.com/pterm/pterm"
 	"github.com/onaonbir/Cloodsy-S3/server"
 	"github.com/onaonbir/Cloodsy-S3/storage"
+	"github.com/onaonbir/Cloodsy-S3/webdav"
 )
 
 // Build-time variables (injected via -ldflags)
@@ -79,6 +80,9 @@ Commands:
   bucket versioning enable <name>               Enable bucket versioning
   bucket versioning suspend <name>              Suspend bucket versioning
   bucket versioning status <name>               Show versioning status
+  bucket public-read <enable|disable|status> <name>  Toggle anonymous object read access
+  bucket webdav <enable|disable|status> <name>  Toggle WebDAV mountability for a bucket
+  bucket reprocess <name> [--prefix=<p>]        Regenerate optimized image variants
   bucket lifecycle set <name> --days=<N> [--prefix=<p>]  Set lifecycle rule
   bucket lifecycle get <name>                   Show lifecycle rules
   bucket lifecycle delete <name> [--prefix=<p>] Delete lifecycle rules
@@ -212,6 +216,12 @@ func runServe() {
 		defer admin.StopServer(adminSrv, logger)
 	}
 
+	// Start WebDAV server if enabled
+	if cfg.WebDAV.Enabled {
+		davSrv := webdav.RunServer(database, store, cfg, logger)
+		defer webdav.StopServer(davSrv, logger)
+	}
+
 	// Pass version info to server package for startup logging
 	server.Version = Version
 	server.CommitHash = CommitHash
@@ -294,6 +304,33 @@ func runBucket() {
 			pterm.Error.Printfln("Unknown versioning action: %s\n", action)
 			os.Exit(1)
 		}
+	case "public-read":
+		if len(os.Args) < 5 {
+			pterm.Info.Println( "Usage: cloodsys3 bucket public-read <enable|disable|status> <name>")
+			os.Exit(1)
+		}
+		err = cli.RunBucketPublicRead(database, os.Args[4], os.Args[3])
+	case "webdav":
+		if len(os.Args) < 5 {
+			pterm.Info.Println( "Usage: cloodsys3 bucket webdav <enable|disable|status> <name>")
+			os.Exit(1)
+		}
+		err = cli.RunBucketWebDAV(database, os.Args[4], os.Args[3])
+	case "reprocess":
+		if len(os.Args) < 4 {
+			pterm.Info.Println( "Usage: cloodsys3 bucket reprocess <name> [--prefix=<prefix>]")
+			os.Exit(1)
+		}
+		prefix := getFlag(os.Args[4:], "--prefix")
+		store, serr := storage.NewFileSystem(cfg.Storage.RootDir)
+		if serr != nil {
+			pterm.Error.Printfln("Initializing storage: %v", serr)
+			os.Exit(1)
+		}
+		if dirs, derr := database.GetAllBucketStorageDirs(); derr == nil {
+			store.LoadBucketDirs(dirs)
+		}
+		err = cli.RunBucketReprocess(database, store, cfg, os.Args[3], prefix)
 	case "lifecycle":
 		if len(os.Args) < 4 {
 			pterm.Info.Println( "Usage: cloodsys3 bucket lifecycle <set|get|delete> <name> [options]")

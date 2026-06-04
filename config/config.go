@@ -12,6 +12,29 @@ type Config struct {
 	Storage  StorageConfig  `yaml:"storage"`
 	Logging  LoggingConfig  `yaml:"logging"`
 	Admin    AdminConfig    `yaml:"admin"`
+	Image    ImageConfig    `yaml:"image"`
+	WebDAV   WebDAVConfig   `yaml:"webdav"`
+}
+
+// WebDAVConfig exposes buckets over WebDAV so clients can mount them as network
+// drives. Disabled by default. Auth maps to bucket credentials (access key as
+// username, secret key as password); one credential = one bucket = the mount.
+type WebDAVConfig struct {
+	Enabled bool   `yaml:"enabled"` // master switch, default false
+	Listen  string `yaml:"listen"`  // listen address, default ":9002"
+	Prefix  string `yaml:"prefix"`  // URL path prefix, default "/"
+}
+
+// ImageConfig controls automatic image optimization on upload. Optimization
+// produces a separate, optimized variant alongside the original (the original
+// bytes are never modified). Disabled by default so existing deployments are
+// unaffected.
+type ImageConfig struct {
+	Enabled      bool  `yaml:"enabled"`        // master switch, default false
+	SyncMaxBytes int64 `yaml:"sync_max_bytes"` // <= => optimize inline; > => async. default 2_000_000
+	Quality      int   `yaml:"quality"`        // JPEG quality 1-100, default 75
+	Workers      int   `yaml:"workers"`        // async worker pool size, default 2
+	QueueSize    int   `yaml:"queue_size"`     // async queue buffer, default 256
 }
 
 type AdminConfig struct {
@@ -117,6 +140,26 @@ func applyDefaults(cfg *Config) {
 	}
 	if cfg.Admin.Listen == "" {
 		cfg.Admin.Listen = ":9001"
+	}
+	// Image optimization defaults (only meaningful when Image.Enabled).
+	if cfg.Image.SyncMaxBytes <= 0 {
+		cfg.Image.SyncMaxBytes = 2_000_000
+	}
+	if cfg.Image.Quality <= 0 || cfg.Image.Quality > 100 {
+		cfg.Image.Quality = 75
+	}
+	if cfg.Image.Workers <= 0 {
+		cfg.Image.Workers = 2
+	}
+	if cfg.Image.QueueSize <= 0 {
+		cfg.Image.QueueSize = 256
+	}
+	// WebDAV defaults (only meaningful when WebDAV.Enabled).
+	if cfg.WebDAV.Listen == "" {
+		cfg.WebDAV.Listen = ":9002"
+	}
+	if cfg.WebDAV.Prefix == "" {
+		cfg.WebDAV.Prefix = "/"
 	}
 }
 

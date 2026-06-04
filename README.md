@@ -32,6 +32,10 @@ All metadata is stored in an embedded SQLite database.
 - **Range Requests** — Partial file downloads via standard HTTP Range headers
 - **Conditional Requests** — If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since support
 - **Server-Side Copy** — Copy objects between buckets without re-uploading, including partial copy via ranges
+- **On-the-Fly Image Resizing** — Resize and re-encode images straight from the object URL with `?w=&h=&m=&q=`; originals are never modified and derivatives are cached on disk
+- **Public-Read Buckets** — Opt-in anonymous object reads (GET/HEAD only) so resized image links work in plain `<img>` tags without signing
+- **Image Optimization on Upload** — Automatically generate a smaller optimized variant alongside each uploaded image (small images inline, large ones in the background); the original is preserved
+- **WebDAV Mounting** — Mount a bucket as a network drive over WebDAV (per-bucket opt-in, Basic Auth maps to bucket credentials)
 - **Admin REST API** — Full management API with session-based authentication for GUI/automation
 - **CORS Support** — Browser-based S3 clients work out of the box
 - **TLS Support** — Optional HTTPS with certificate configuration
@@ -122,6 +126,13 @@ All CLI commands work while the server is running. SQLite WAL mode allows concur
 ./cloodsys3 bucket quota <name> 10GB                      # Set storage limit (KB/MB/GB/TB, 0=unlimited)
 ./cloodsys3 bucket storage <name> --dir=/new/path         # Move storage to new location
 ./cloodsys3 bucket storage <name> --dir=                  # Reset to default storage
+./cloodsys3 bucket public-read enable <name>              # Allow anonymous object reads (GET/HEAD)
+./cloodsys3 bucket public-read disable <name>             # Disable anonymous reads (default)
+./cloodsys3 bucket public-read status <name>              # Show public-read state
+./cloodsys3 bucket webdav enable <name>                   # Make bucket mountable via WebDAV
+./cloodsys3 bucket webdav disable <name>                  # Disable WebDAV for the bucket (default)
+./cloodsys3 bucket webdav status <name>                   # Show WebDAV state
+./cloodsys3 bucket reprocess <name> [--prefix=p/]         # Regenerate optimized image variants
 ```
 
 ### Credential Management
@@ -186,6 +197,83 @@ Notes:
 - `--storage-dir` / `--dir` must be an absolute path
 - Deleting a bucket removes its storage directory regardless of location
 - Server restart required after CLI-based storage changes while server is running
+
+### Image Resizing & Optimization
+
+Cloodsy S3 can transform images on the fly and optimize them on upload. Both features keep the **original object byte-for-byte intact** — every derivative is content-addressed and cached in a sibling `.<bucket>-cache/` tree (which honors custom storage directories) and is invalidated automatically when the object changes or is deleted.
+
+**On-the-fly resizing** — append query parameters to any image object URL:
+
+```
+GET /<bucket>/<key>?w=800&h=600&m=f&q=75
+```
+
+| Param | Meaning | Values |
+|-------|---------|--------|
+| `w` | Target width (px) | 1–5000 |
+| `h` | Target height (px) | 1–5000 |
+| `m` | Fit mode | `f` = fit/proportional (default), `c` = cover/center-crop, `e` = exact/stretch |
+| `q` | JPEG quality | 1–100 (default 75) |
+
+Decoders: JPEG, PNG, GIF, and WebP (decode-only — WebP/GIF inputs are transcoded to JPEG/PNG since there is no pure-Go WebP encoder). Sources larger than ~50 MP are rejected before decode to bound memory, and any transform error transparently falls back to serving the original. Transformed responses are returned `inline` with a distinct ETag and a long `Cache-Control`, so they render directly in `<img>` tags and cache well at CDNs.
+
+**Optimization on upload** — enable in config to auto-generate a smaller, re-encoded variant for each uploaded image:
+
+```yaml
+image:
+  enabled: true
+  sync_max_bytes: 2000000   # <= optimize inline; larger uploads go to the background queue
+  quality: 75
+  workers: 2
+  queue_size: 256
+```
+
+To (re)generate variants for objects that already exist, run:
+
+```bash
+./cloodsys3 bucket reprocess <name>              # Whole bucket
+./cloodsys3 bucket reprocess <name> --prefix=img/ # Only a prefix
+```
+
+### Public-Read Buckets
+
+By default every request requires SigV4 or a presigned URL. Flagging a bucket **public-read** additionally allows **anonymous GET/HEAD of objects** — useful for public assets and for resized image links embedded in web pages. Listings and all writes still require authentication, so a public bucket exposes object reads but never enumeration. Signed access is unchanged.
+
+```bash
+./cloodsys3 bucket public-read enable <name>
+./cloodsys3 bucket public-read disable <name>
+./cloodsys3 bucket public-read status <name>
+```
+
+```html
+<!-- Works without signing when the bucket is public-read -->
+<img src="http://localhost:9000/images/photo.jpg?w=400&q=70">
+```
+
+### WebDAV Mounting
+
+Cloodsy S3 can expose buckets over WebDAV so they can be mounted as a network drive. WebDAV runs on its own port and is gated twice: a global master switch in config, and a **per-bucket opt-in** (every bucket is OFF by default).
+
+```yaml
+webdav:
+  enabled: true       # master switch — runs the WebDAV server
+  listen: ":9002"
+  prefix: "/"
+```
+
+```bash
+./cloodsys3 bucket webdav enable <name>    # opt the bucket in
+./cloodsys3 bucket webdav disable <name>
+./cloodsys3 bucket webdav status <name>
+```
+
+**Mounting** — authenticate with HTTP Basic Auth where the **username is an access key** and the **password is its secret key**. One credential maps to exactly one bucket, which becomes the mount root.
+
+- **Windows:** File Explorer → "Map network drive" → `http://<host>:9002/`
+- **macOS:** Finder → Cmd+K → `http://<host>:9002/`
+- **Linux/CLI:** `rclone`, `cadaver`, or `davfs2`
+
+Read-only credentials may browse and download but receive `403 Forbidden` on any write (PUT/DELETE/MKCOL/MOVE). Files written over WebDAV are real S3 objects and are visible through the S3 API as well. Folders are virtual key prefixes; locks are in-memory (non-persistent across restarts).
 
 ### Webhook Notifications
 
@@ -378,6 +466,9 @@ Sessions expire after 24 hours. Tokens are stored in-memory and cleared on serve
 | PUT | `/admin/buckets/{name}/quota` | Set quota |
 | PUT | `/admin/buckets/{name}/storage` | Change storage directory |
 | GET/PUT | `/admin/buckets/{name}/versioning` | Get/set versioning |
+| PUT | `/admin/buckets/{name}/public-read` | Toggle anonymous object reads |
+| PUT | `/admin/buckets/{name}/webdav` | Toggle WebDAV mountability |
+| POST | `/admin/buckets/{name}/reprocess` | Regenerate optimized image variants (background) |
 | GET | `/admin/buckets/{name}/credentials` | List credentials (includes secret keys) |
 | POST | `/admin/buckets/{name}/credentials` | Create credential |
 | DELETE | `/admin/credentials/{accessKey}` | Delete credential |
@@ -429,6 +520,18 @@ admin:
   listen: ":9001"             # Admin API port (separate from S3)
   cors_origins:               # Allowed origins for CORS
     - "*"
+
+image:
+  enabled: false              # Auto image optimization on upload (original preserved)
+  sync_max_bytes: 2000000     # <= optimize inline; larger uploads go async
+  quality: 75                 # JPEG quality (1-100)
+  workers: 2                  # Async optimization workers
+  queue_size: 256             # Async queue buffer size
+
+webdav:
+  enabled: false              # Run the WebDAV server (master switch)
+  listen: ":9002"             # WebDAV port (separate from S3 and Admin)
+  prefix: "/"                 # URL path prefix; buckets are opt-in (default OFF)
 ```
 
 ## Install

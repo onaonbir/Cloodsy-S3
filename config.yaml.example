@@ -3,31 +3,46 @@
 # All values below are defaults - only override what you need.
 
 server:
-  listen: ":9000"              # Dinlenecek adres ve port
-  region: "us-east-1"          # S3 region adi (SigV4 imzalamada kullanilir)
+  listen: ":9000"              # Listen address and port
+  region: "us-east-1"          # S3 region name (used for SigV4 signing)
   tls:
     enabled: false
-    cert_file: ""              # TLS sertifika dosyasi yolu
-    key_file: ""               # TLS private key dosyasi yolu
+    cert_file: ""              # Path to the TLS certificate file
+    key_file: ""               # Path to the TLS private key file
 
 database:
-  path: "./.cloodsys3/cloodsys3.db"   # SQLite veritabani dosyasi
-  busy_timeout: 5000                   # SQLite busy timeout (ms) - yazma kilidi bekleme suresi
-  cache_size: 64000                    # SQLite page cache boyutu (KB)
-  mmap_size: 134217728                 # SQLite memory-mapped I/O boyutu (bytes, 128MB)
-  max_readers: 4                       # Paralel okuma baglanti sayisi
+  path: "./.cloodsys3/cloodsys3.db"   # SQLite database file
+  busy_timeout: 5000                   # SQLite busy timeout (ms) - write-lock wait time
+  cache_size: 64000                    # SQLite page cache size (KB)
+  mmap_size: 134217728                 # SQLite memory-mapped I/O size (bytes, 128MB)
+  max_readers: 4                       # Number of parallel read connections
 
 storage:
-  root_dir: "./.cloodsys3/data"        # Obje dosyalarinin saklanacagi kok dizin
-  multipart_max_age: "24h"             # Tamamlanmamis multipart upload temizleme suresi
-  lifecycle_interval: "1h"             # Lifecycle rule kontrol araligi
+  root_dir: "./.cloodsys3/data"        # Root directory where object files are stored
+  multipart_max_age: "24h"             # Cleanup age for incomplete multipart uploads
+  lifecycle_interval: "1h"             # How often lifecycle rules are evaluated
 
 logging:
-  level: "info"                # Log seviyesi: debug, info, warn, error
-  format: "text"               # Log formati: text veya json
+  level: "info"                # Log level: debug, info, warn, error
+  format: "text"               # Log format: text or json
 
 admin:
-  enabled: false               # Admin API'yi etkinlestir (Flutter GUI icin)
-  listen: ":9001"              # Admin API portu (S3 API'den ayri)
-  cors_origins:                # Flutter web icin izin verilen origin'ler
+  enabled: false               # Enable the Admin API (used by the Flutter GUI)
+  listen: ":9001"              # Admin API port (separate from the S3 API)
+  cors_origins:                # Allowed origins (for the Flutter web build)
     - "*"
+
+image:
+  enabled: false               # Automatic image optimization on upload (original is preserved)
+  sync_max_bytes: 2000000      # Images <= this size are optimized synchronously, larger ones asynchronously
+  quality: 75                  # JPEG quality (1-100)
+  workers: 2                   # Number of async optimization workers
+  queue_size: 256              # Async queue buffer size
+
+webdav:
+  enabled: false               # Run the WebDAV server (master switch)
+  listen: ":9002"              # WebDAV port (separate from the S3 and Admin ports)
+  prefix: "/"                  # URL path prefix
+  # Even with the master switch on, every bucket is OFF by default; enable per bucket:
+  #   cloodsys3 bucket webdav enable <bucket>   (or in the GUI: Settings > WebDAV Access)
+  # Login: username = access key, password = secret key (one credential = one bucket)

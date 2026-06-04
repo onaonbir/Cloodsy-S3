@@ -269,6 +269,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "versioning" && r.Method == http.MethodPut:
 		h.handleSetVersioning(w, r, parts[1])
 
+	// PUT /admin/buckets/{name}/public-read
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "public-read" && r.Method == http.MethodPut:
+		h.handleSetPublicRead(w, r, parts[1])
+
+	// PUT /admin/buckets/{name}/webdav
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "webdav" && r.Method == http.MethodPut:
+		h.handleSetWebDAV(w, r, parts[1])
+
+	// POST /admin/buckets/{name}/reprocess
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "reprocess" && r.Method == http.MethodPost:
+		h.handleReprocess(w, r, parts[1])
+
 	// GET/POST /admin/buckets/{name}/credentials
 	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "credentials" && r.Method == http.MethodGet:
 		h.handleListCredentials(w, r, parts[1])
@@ -408,6 +420,10 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 		"version":      h.Version,
 		"buckets":      len(buckets),
 		"admin_exists": hasAdmin,
+		"webdav": map[string]interface{}{
+			"enabled": h.Config.WebDAV.Enabled,
+			"listen":  h.Config.WebDAV.Listen,
+		},
 	})
 }
 

@@ -12,6 +12,7 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/db"
 	"github.com/onaonbir/Cloodsy-S3/handler"
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/lifecycle"
 	"github.com/onaonbir/Cloodsy-S3/storage"
 	"github.com/onaonbir/Cloodsy-S3/webhook"
@@ -64,10 +65,26 @@ func Run(cfg *config.Config, h *handler.Handler, logger *slog.Logger) error {
 	dispatcher := webhook.NewDispatcher(h.DB, 4, logger)
 	h.Dispatcher = dispatcher
 
+	// Start image optimizer (optional; preserves originals, generates variants)
+	var imageWorker *imageutil.Worker
+	if cfg.Image.Enabled {
+		imageWorker = imageutil.NewWorker(h.Storage, imageutil.WorkerConfig{
+			Quality:   cfg.Image.Quality,
+			Workers:   cfg.Image.Workers,
+			QueueSize: cfg.Image.QueueSize,
+		}, logger)
+		imageWorker.Start(ctx)
+		h.ImageWorker = imageWorker
+		logger.Info("image optimizer enabled", "quality", cfg.Image.Quality, "syncMaxBytes", cfg.Image.SyncMaxBytes)
+	}
+
 	go func() {
 		<-ctx.Done()
 		logger.Info("shutting down server...")
 		dispatcher.Stop()
+		if imageWorker != nil {
+			imageWorker.Stop()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
 		srv.Shutdown(shutdownCtx)

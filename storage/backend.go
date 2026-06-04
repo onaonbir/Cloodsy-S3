@@ -38,4 +38,13 @@ type Backend interface {
 	GetVersionedObject(bucket, key, versionID string) (io.ReadCloser, error)
 	DeleteVersionedObject(bucket, key, versionID string) error
 	AssembleMultipartPartsVersioned(bucket, key, versionID, uploadID string, partNumbers []int) (int64, string, error)
+
+	// Variant cache operations — derived (resized/optimized) images are cached
+	// in a sibling .<bucket>-cache tree so the original object is never touched.
+	// cacheKey is an opaque content-addressed identifier (includes the object's
+	// etag/version) so cached entries self-invalidate when the original changes.
+	GetVariant(bucket, cacheKey string) (io.ReadCloser, int64, error)
+	PutVariant(bucket, cacheKey string, data []byte) error
+	DeleteVariantsForKey(bucket, key string) error
+	DeleteAllVariantsForBucket(bucket string) error
 }

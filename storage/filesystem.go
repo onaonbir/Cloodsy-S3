@@ -2,6 +2,8 @@ package storage
 
 import (
 	"crypto/md5"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -208,6 +210,10 @@ func (fs *FileSystem) DeleteBucketDir(bucket string) error {
 	// Also nuke the sibling multipart staging tree so abandoned parts don't linger.
 	if mpDir, mpErr := fs.multipartBucketDir(bucket); mpErr == nil {
 		os.RemoveAll(mpDir)
+	}
+	// And the sibling variant cache tree (resized/optimized derivatives).
+	if cacheDir, cErr := fs.variantBucketDir(bucket); cErr == nil {
+		os.RemoveAll(cacheDir)
 	}
 	fs.RemoveBucketDir(bucket)
 	return err
@@ -519,6 +525,125 @@ func (fs *FileSystem) DeleteMultipartParts(bucket, uploadID string) error {
 // Called when a bucket is being deleted so that orphan parts don't linger on disk.
 func (fs *FileSystem) DeleteAllMultipartForBucket(bucket string) error {
 	dir, err := fs.multipartBucketDir(bucket)
+	if err != nil {
+		return err
+	}
+	return os.RemoveAll(dir)
+}
+
+// --- Variant cache (resized / optimized image derivatives) ---
+//
+// Derivatives live in a sibling directory of the bucket data dir, under the
+// bucket's effective base path: <bucketBase>/.<bucket>-cache/<keyHash>/<variantHash>.cloodsys3ext
+// Grouping by keyHash (SHA-256 of the object key) lets DeleteVariantsForKey
+// remove every derivative of an object with a single RemoveAll. The variant
+// hash embeds the source etag/version, so a changed original yields new
+// filenames and stale entries are pruned on object/bucket delete.
+
+// VariantCacheKey builds the opaque cache identifier for a derivative. spec
+// encodes the transform request (e.g. "w800h0mfq75" or "opt"). The returned
+// value is "<keyHash>/<variantHash>" and is safe to pass to Get/PutVariant.
+func VariantCacheKey(key, versionID, etag, spec string) string {
+	keyHash := sha256.Sum256([]byte(key))
+	vh := sha256.Sum256([]byte(key + "\x00" + versionID + "\x00" + etag + "\x00" + spec))
+	return hex.EncodeToString(keyHash[:]) + "/" + hex.EncodeToString(vh[:])
+}
+
+// variantBucketDir returns the per-bucket cache root (without a key/variant).
+func (fs *FileSystem) variantBucketDir(bucket string) (string, error) {
+	if bucket == "" {
+		return "", fmt.Errorf("bucket is required")
+	}
+	base := fs.bucketBasePath(bucket)
+	dir, err := safePath(base, "."+bucket+"-cache")
+	if err != nil {
+		return "", fmt.Errorf("invalid cache path: %w", err)
+	}
+	return dir, nil
+}
+
+// validCacheKey matches "<64 hex>/<64 hex>" as produced by VariantCacheKey.
+var validCacheKey = regexp.MustCompile(`^[0-9a-f]{64}/[0-9a-f]{64}$`)
+
+func (fs *FileSystem) variantPath(bucket, cacheKey string) (string, error) {
+	if !validCacheKey.MatchString(cacheKey) {
+		return "", fmt.Errorf("invalid cache key format")
+	}
+	base := fs.bucketBasePath(bucket)
+	p, err := safePath(base, filepath.Join("."+bucket+"-cache", cacheKey))
+	if err != nil {
+		return "", fmt.Errorf("invalid cache path: %w", err)
+	}
+	return p + safeExt, nil
+}
+
+// GetVariant returns a reader for a cached derivative plus its size, or
+// (nil, 0, nil) on a cache miss.
+func (fs *FileSystem) GetVariant(bucket, cacheKey string) (io.ReadCloser, int64, error) {
+	p, err := fs.variantPath(bucket, cacheKey)
+	if err != nil {
+		return nil, 0, err
+	}
+	f, err := os.OpenFile(p, os.O_RDONLY|openNoFollow, 0)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil, 0, nil // miss
+		}
+		return nil, 0, err
+	}
+	fi, err := f.Stat()
+	if err != nil {
+		f.Close()
+		return nil, 0, err
+	}
+	if !fi.Mode().IsRegular() {
+		f.Close()
+		return nil, 0, fmt.Errorf("not a regular file")
+	}
+	return f, fi.Size(), nil
+}
+
+// PutVariant atomically writes a derivative into the cache (temp file + rename).
+func (fs *FileSystem) PutVariant(bucket, cacheKey string, data []byte) error {
+	p, err := fs.variantPath(bucket, cacheKey)
+	if err != nil {
+		return err
+	}
+	if err := os.MkdirAll(filepath.Dir(p), 0700); err != nil {
+		return fmt.Errorf("create cache dir: %w", err)
+	}
+	tmpFile, err := os.CreateTemp(filepath.Dir(p), ".tmp-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmpFile.Name()
+	if _, err := tmpFile.Write(data); err != nil {
+		tmpFile.Close()
+		os.Remove(tmpPath)
+		return err
+	}
+	tmpFile.Close()
+	if err := os.Rename(tmpPath, p); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
+}
+
+// DeleteVariantsForKey removes every cached derivative belonging to an object.
+func (fs *FileSystem) DeleteVariantsForKey(bucket, key string) error {
+	base := fs.bucketBasePath(bucket)
+	keyHash := sha256.Sum256([]byte(key))
+	dir, err := safePath(base, filepath.Join("."+bucket+"-cache", hex.EncodeToString(keyHash[:])))
+	if err != nil {
+		return fmt.Errorf("invalid cache path: %w", err)
+	}
+	return os.RemoveAll(dir)
+}
+
+// DeleteAllVariantsForBucket removes the entire .<bucket>-cache tree.
+func (fs *FileSystem) DeleteAllVariantsForBucket(bucket string) error {
+	dir, err := fs.variantBucketDir(bucket)
 	if err != nil {
 		return err
 	}

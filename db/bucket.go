@@ -6,12 +6,14 @@ import (
 )
 
 type Bucket struct {
-	ID         int64
-	Name       string
-	QuotaBytes int64
-	Versioning string // "", "Enabled", "Suspended"
-	StorageDir string // custom storage directory; empty = use global RootDir
-	CreatedAt  time.Time
+	ID            int64
+	Name          string
+	QuotaBytes    int64
+	Versioning    string // "", "Enabled", "Suspended"
+	StorageDir    string // custom storage directory; empty = use global RootDir
+	PublicRead    bool   // when true, anonymous GET/HEAD of objects is allowed
+	WebDAVEnabled bool   // when true (and global webdav on), bucket is mountable via WebDAV
+	CreatedAt     time.Time
 }
 
 type BucketCredential struct {
@@ -40,8 +42,8 @@ func (d *DB) CreateBucket(name, storageDir string) (*Bucket, error) {
 
 func (d *DB) GetBucket(name string) (*Bucket, error) {
 	b := &Bucket{}
-	err := d.reader.QueryRow("SELECT id, name, quota_bytes, versioning, storage_dir, created_at FROM buckets WHERE name = ?", name).
-		Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.CreatedAt)
+	err := d.reader.QueryRow("SELECT id, name, quota_bytes, versioning, storage_dir, public_read, webdav_enabled, created_at FROM buckets WHERE name = ?", name).
+		Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.PublicRead, &b.WebDAVEnabled, &b.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -61,8 +63,8 @@ func (d *DB) GetBucketNameByID(id int64) (string, error) {
 
 func (d *DB) GetBucketByID(id int64) (*Bucket, error) {
 	b := &Bucket{}
-	err := d.reader.QueryRow("SELECT id, name, quota_bytes, versioning, storage_dir, created_at FROM buckets WHERE id = ?", id).
-		Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.CreatedAt)
+	err := d.reader.QueryRow("SELECT id, name, quota_bytes, versioning, storage_dir, public_read, webdav_enabled, created_at FROM buckets WHERE id = ?", id).
+		Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.PublicRead, &b.WebDAVEnabled, &b.CreatedAt)
 	if err == sql.ErrNoRows {
 		return nil, nil
 	}
@@ -70,7 +72,7 @@ func (d *DB) GetBucketByID(id int64) (*Bucket, error) {
 }
 
 func (d *DB) ListBuckets() ([]Bucket, error) {
-	rows, err := d.reader.Query("SELECT id, name, quota_bytes, versioning, storage_dir, created_at FROM buckets ORDER BY name")
+	rows, err := d.reader.Query("SELECT id, name, quota_bytes, versioning, storage_dir, public_read, webdav_enabled, created_at FROM buckets ORDER BY name")
 	if err != nil {
 		return nil, err
 	}
@@ -79,7 +81,7 @@ func (d *DB) ListBuckets() ([]Bucket, error) {
 	var buckets []Bucket
 	for rows.Next() {
 		var b Bucket
-		if err := rows.Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.PublicRead, &b.WebDAVEnabled, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		buckets = append(buckets, b)
@@ -91,7 +93,7 @@ func (d *DB) ListBucketsByIDs(ids []int64) ([]Bucket, error) {
 	if len(ids) == 0 {
 		return nil, nil
 	}
-	query := "SELECT id, name, quota_bytes, versioning, storage_dir, created_at FROM buckets WHERE id IN ("
+	query := "SELECT id, name, quota_bytes, versioning, storage_dir, public_read, webdav_enabled, created_at FROM buckets WHERE id IN ("
 	args := make([]interface{}, len(ids))
 	for i, id := range ids {
 		if i > 0 {
@@ -111,7 +113,7 @@ func (d *DB) ListBucketsByIDs(ids []int64) ([]Bucket, error) {
 	var buckets []Bucket
 	for rows.Next() {
 		var b Bucket
-		if err := rows.Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.CreatedAt); err != nil {
+		if err := rows.Scan(&b.ID, &b.Name, &b.QuotaBytes, &b.Versioning, &b.StorageDir, &b.PublicRead, &b.WebDAVEnabled, &b.CreatedAt); err != nil {
 			return nil, err
 		}
 		buckets = append(buckets, b)
@@ -281,6 +283,23 @@ func (d *DB) GetBucketIDsForAccessKey(accessKey string) ([]int64, error) {
 func (d *DB) SetBucketVersioning(name, versioning string) error {
 	return d.withRetry(func() error {
 		_, err := d.writer.Exec("UPDATE buckets SET versioning = ? WHERE name = ?", versioning, name)
+		return err
+	})
+}
+
+// SetBucketPublicRead toggles anonymous object read access for a bucket.
+func (d *DB) SetBucketPublicRead(name string, enabled bool) error {
+	return d.withRetry(func() error {
+		_, err := d.writer.Exec("UPDATE buckets SET public_read = ? WHERE name = ?", enabled, name)
+		return err
+	})
+}
+
+// SetBucketWebDAVEnabled toggles WebDAV mountability for a bucket (effective
+// only when the global WebDAV server is enabled).
+func (d *DB) SetBucketWebDAVEnabled(name string, enabled bool) error {
+	return d.withRetry(func() error {
+		_, err := d.writer.Exec("UPDATE buckets SET webdav_enabled = ? WHERE name = ?", enabled, name)
 		return err
 	})
 }

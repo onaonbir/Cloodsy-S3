@@ -11,7 +11,10 @@ import (
 	"strings"
 
 	"github.com/onaonbir/Cloodsy-S3/auth"
+	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/db"
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
+	"github.com/onaonbir/Cloodsy-S3/storage"
 	"github.com/pterm/pterm"
 	"golang.org/x/crypto/bcrypt"
 )
@@ -423,6 +426,129 @@ func RunBucketVersioningStatus(database *db.DB, name string) error {
 		status = "Disabled"
 	}
 	pterm.Info.Printfln("Bucket '%s' versioning: %s", name, pterm.Cyan(status))
+	return nil
+}
+
+// RunBucketPublicRead toggles anonymous object read access for a bucket.
+// action is one of "enable", "disable", "status".
+func RunBucketPublicRead(database *db.DB, name, action string) error {
+	bucket, err := database.GetBucket(name)
+	if err != nil {
+		return fmt.Errorf("get bucket: %w", err)
+	}
+	if bucket == nil {
+		return fmt.Errorf("bucket '%s' not found", name)
+	}
+
+	switch action {
+	case "enable":
+		if err := database.SetBucketPublicRead(name, true); err != nil {
+			return fmt.Errorf("set public-read: %w", err)
+		}
+		pterm.Success.Printfln("Public read enabled for bucket '%s'. Anonymous GET/HEAD is now allowed.", name)
+	case "disable":
+		if err := database.SetBucketPublicRead(name, false); err != nil {
+			return fmt.Errorf("set public-read: %w", err)
+		}
+		pterm.Success.Printfln("Public read disabled for bucket '%s'.", name)
+	case "status":
+		status := "Disabled"
+		if bucket.PublicRead {
+			status = "Enabled"
+		}
+		pterm.Info.Printfln("Bucket '%s' public-read: %s", name, pterm.Cyan(status))
+	default:
+		return fmt.Errorf("unknown public-read action: %s (use enable|disable|status)", action)
+	}
+	return nil
+}
+
+// RunBucketReprocess (re)generates optimized image variants for existing
+// objects in a bucket. Originals are never modified. Useful after enabling
+// image optimization on a bucket that already has content.
+func RunBucketReprocess(database *db.DB, store storage.Backend, cfg *config.Config, name, prefix string) error {
+	bucket, err := database.GetBucket(name)
+	if err != nil {
+		return fmt.Errorf("get bucket: %w", err)
+	}
+	if bucket == nil {
+		return fmt.Errorf("bucket '%s' not found", name)
+	}
+
+	quality := cfg.Image.Quality
+	if quality <= 0 || quality > 100 {
+		quality = 75
+	}
+
+	var processed, skipped, failed int
+	marker := ""
+	for {
+		// No delimiter → flat listing of all keys under the prefix.
+		objects, _, truncated, next, err := database.ListObjectsMeta(bucket.ID, prefix, marker, "", 1000)
+		if err != nil {
+			return fmt.Errorf("list objects: %w", err)
+		}
+		for i := range objects {
+			m := objects[i]
+			if m.IsDeleteMarker || !imageutil.IsImageContentType(m.ContentType) {
+				skipped++
+				continue
+			}
+			job := imageutil.Job{
+				Bucket:      name,
+				Key:         m.Key,
+				VersionID:   m.VersionID,
+				ETag:        m.ETag,
+				ContentType: m.ContentType,
+			}
+			if err := imageutil.OptimizeOne(store, job, quality); err != nil {
+				failed++
+				pterm.Warning.Printfln("  %s: %v", m.Key, err)
+				continue
+			}
+			processed++
+		}
+		if !truncated {
+			break
+		}
+		marker = next
+	}
+
+	pterm.Success.Printfln("Reprocess complete for '%s': %d optimized, %d skipped, %d failed.", name, processed, skipped, failed)
+	return nil
+}
+
+// RunBucketWebDAV toggles WebDAV mountability for a bucket. Effective only when
+// the global WebDAV server is enabled in config. action: enable|disable|status.
+func RunBucketWebDAV(database *db.DB, name, action string) error {
+	bucket, err := database.GetBucket(name)
+	if err != nil {
+		return fmt.Errorf("get bucket: %w", err)
+	}
+	if bucket == nil {
+		return fmt.Errorf("bucket '%s' not found", name)
+	}
+
+	switch action {
+	case "enable":
+		if err := database.SetBucketWebDAVEnabled(name, true); err != nil {
+			return fmt.Errorf("set webdav: %w", err)
+		}
+		pterm.Success.Printfln("WebDAV enabled for bucket '%s' (requires global webdav.enabled).", name)
+	case "disable":
+		if err := database.SetBucketWebDAVEnabled(name, false); err != nil {
+			return fmt.Errorf("set webdav: %w", err)
+		}
+		pterm.Success.Printfln("WebDAV disabled for bucket '%s'.", name)
+	case "status":
+		status := "Disabled"
+		if bucket.WebDAVEnabled {
+			status = "Enabled"
+		}
+		pterm.Info.Printfln("Bucket '%s' webdav: %s", name, pterm.Cyan(status))
+	default:
+		return fmt.Errorf("unknown webdav action: %s (use enable|disable|status)", action)
+	}
 	return nil
 }
 

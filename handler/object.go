@@ -10,7 +10,9 @@ import (
 	"time"
 
 	"github.com/onaonbir/Cloodsy-S3/db"
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
+	"github.com/onaonbir/Cloodsy-S3/storage"
 	"github.com/onaonbir/Cloodsy-S3/webhook"
 )
 
@@ -148,23 +150,30 @@ func (h *Handler) PutObject(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
+	// Best-effort image optimization (original is preserved; an optimized
+	// variant is generated alongside). Small images inline, large ones queued.
+	// Never affects the PUT result.
+	if h.ImageWorker != nil && h.Config.Image.Enabled && imageutil.IsImageContentType(contentType) {
+		job := imageutil.Job{Bucket: bucketName, Key: key, VersionID: versionID, ETag: etag, ContentType: contentType}
+		if size <= h.Config.Image.SyncMaxBytes {
+			h.ImageWorker.Process(job)
+		} else {
+			h.ImageWorker.Enqueue(job)
+		}
+	}
+
 	w.WriteHeader(http.StatusOK)
 }
 
 // GetObject handles GET /<bucket>/<key>
 func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-
 	bucketName, key := getBucketAndKey(r)
 	if key == "" {
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 		return
 	}
 
-	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
+	bucket, _, ok := h.authenticateOrPublic(w, r, bucketName)
 	if !ok {
 		return
 	}
@@ -197,6 +206,15 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 		}
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 		return
+	}
+
+	// Image transform-on-access (?w=&h=&m=&q=). Served from a sibling cache;
+	// on any error serveTransformed returns false and we fall through to the
+	// normal full-object path, so a transform failure never breaks a download.
+	if tp, want := imageutil.ParseParams(r.URL.Query()); want && imageutil.IsImageContentType(meta.ContentType) {
+		if h.serveTransformed(w, r, bucket, meta, tp) {
+			return
+		}
 	}
 
 	// Conditional headers check
@@ -244,18 +262,13 @@ func (h *Handler) GetObject(w http.ResponseWriter, r *http.Request) {
 
 // HeadObject handles HEAD /<bucket>/<key>
 func (h *Handler) HeadObject(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-
 	bucketName, key := getBucketAndKey(r)
 	if key == "" {
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 		return
 	}
 
-	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
+	bucket, _, ok := h.authenticateOrPublic(w, r, bucketName)
 	if !ok {
 		return
 	}
@@ -399,6 +412,7 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 			h.Logger.Error("failed to delete null version", "error", err)
 		}
 		h.Storage.DeleteObject(bucketName, key)
+		h.Storage.DeleteVariantsForKey(bucketName, key)
 
 		// Also delete the latest-marked version from DB
 		if err := h.DB.DeleteObjectMeta(bucket.ID, key); err != nil {
@@ -416,6 +430,7 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 		if err := h.Storage.DeleteObject(bucketName, key); err != nil {
 			h.Logger.Error("failed to delete object from storage", "bucket", bucketName, "key", key, "error", err)
 		}
+		h.Storage.DeleteVariantsForKey(bucketName, key)
 	}
 
 	// Emit webhook event
@@ -429,6 +444,95 @@ func (h *Handler) DeleteObject(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+// serveTransformed serves a resized/optimized derivative of an image object.
+// It returns true if it produced the response (cache hit, fresh transform, or a
+// conditional 304). It returns false WITHOUT writing anything when it cannot
+// transform (open error or decode/encode failure) so the caller falls back to
+// streaming the original object untouched. The original bytes are never
+// modified — derivatives live in a sibling .<bucket>-cache tree.
+func (h *Handler) serveTransformed(w http.ResponseWriter, r *http.Request, bucket *db.Bucket, meta *db.ObjectMeta, tp imageutil.Params) bool {
+	cacheKey := storage.VariantCacheKey(meta.Key, meta.VersionID, meta.ETag, tp.Spec())
+	variantETag := variantETagFromKey(cacheKey, meta.ETag)
+
+	// Cache hit → serve straight from disk.
+	if rc, size, err := h.Storage.GetVariant(bucket.Name, cacheKey); err == nil && rc != nil {
+		defer rc.Close()
+		if !h.CheckConditionalHeaders(w, r, variantETag, meta.LastModified) {
+			return true
+		}
+		h.writeVariantHeaders(w, variantContentType(meta.ContentType), variantETag, meta.LastModified, size)
+		w.WriteHeader(http.StatusOK)
+		io.Copy(w, rc)
+		return true
+	}
+
+	// Miss → open the original and transform it in memory.
+	var src io.ReadCloser
+	var err error
+	if meta.VersionID != "" && meta.VersionID != "null" {
+		src, err = h.Storage.GetVersionedObject(bucket.Name, meta.Key, meta.VersionID)
+	} else {
+		src, err = h.Storage.GetObject(bucket.Name, meta.Key)
+	}
+	if err != nil {
+		return false // fall back to normal serving
+	}
+	data, ct, terr := imageutil.Transform(src, meta.ContentType, tp)
+	src.Close()
+	if terr != nil {
+		h.Logger.Warn("image transform failed; serving original", "key", meta.Key, "error", terr)
+		return false
+	}
+
+	// Best-effort cache write — a failure here doesn't affect the response.
+	if perr := h.Storage.PutVariant(bucket.Name, cacheKey, data); perr != nil {
+		h.Logger.Debug("variant cache write failed", "error", perr)
+	}
+
+	if !h.CheckConditionalHeaders(w, r, variantETag, meta.LastModified) {
+		return true
+	}
+	h.writeVariantHeaders(w, ct, variantETag, meta.LastModified, int64(len(data)))
+	w.WriteHeader(http.StatusOK)
+	w.Write(data)
+	return true
+}
+
+// writeVariantHeaders sets response headers for a transformed image. Range is
+// not honored (the byte length differs from the original), and the response is
+// marked inline + cacheable so it renders in <img> tags and survives at CDNs.
+func (h *Handler) writeVariantHeaders(w http.ResponseWriter, ct, etag string, lastMod time.Time, size int64) {
+	w.Header().Set("Content-Type", ct)
+	w.Header().Set("ETag", etag)
+	w.Header().Set("Last-Modified", lastMod.UTC().Format(http.TimeFormat))
+	w.Header().Set("Accept-Ranges", "none")
+	w.Header().Set("Content-Disposition", "inline")
+	w.Header().Set("Cache-Control", "public, max-age=86400")
+	w.Header().Set("Content-Length", strconv.FormatInt(size, 10))
+}
+
+// variantETagFromKey derives a stable, distinct ETag for a derivative from its
+// content-addressed cache key (the variant-hash segment), so caches never
+// confuse a resized image with the original. Falls back to the original ETag.
+func variantETagFromKey(cacheKey, fallback string) string {
+	if i := strings.IndexByte(cacheKey, '/'); i >= 0 && len(cacheKey) >= i+33 {
+		return "\"" + cacheKey[i+1:i+33] + "\""
+	}
+	return fallback
+}
+
+// variantContentType mirrors the encoder choice in image.Transform: PNG/GIF/WebP
+// sources become PNG, everything else becomes JPEG. Used on the cache-hit path
+// where the stored content-type isn't persisted separately.
+func variantContentType(srcCT string) string {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(srcCT, ";")[0])) {
+	case "image/png", "image/gif", "image/webp":
+		return "image/png"
+	default:
+		return "image/jpeg"
+	}
 }
 
 // serveRange handles Range requests

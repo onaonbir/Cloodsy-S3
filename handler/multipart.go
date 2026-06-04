@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/onaonbir/Cloodsy-S3/db"
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 	"github.com/onaonbir/Cloodsy-S3/s3xml"
 	"github.com/onaonbir/Cloodsy-S3/webhook"
@@ -324,6 +325,17 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 			VersionID:  versionID,
 			Timestamp:  now,
 		})
+	}
+
+	// Best-effort image optimization for multipart-uploaded images (large images
+	// typically arrive this way). Original is preserved; variant generated async.
+	if h.ImageWorker != nil && h.Config.Image.Enabled && imageutil.IsImageContentType(upload.ContentType) {
+		job := imageutil.Job{Bucket: bucketName, Key: key, VersionID: versionID, ETag: etag, ContentType: upload.ContentType}
+		if totalSize <= h.Config.Image.SyncMaxBytes {
+			h.ImageWorker.Process(job)
+		} else {
+			h.ImageWorker.Enqueue(job)
+		}
 	}
 
 	result := s3xml.CompleteMultipartUploadResult{

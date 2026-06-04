@@ -225,6 +225,8 @@ func (d *DB) migrate() error {
 		"ALTER TABLE bucket_credentials ADD COLUMN name TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE bucket_webhooks ADD COLUMN name TEXT NOT NULL DEFAULT ''",
 		"ALTER TABLE lifecycle_rules ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE buckets ADD COLUMN webdav_enabled INTEGER NOT NULL DEFAULT 0",
 	}
 	for _, m := range migrations {
 		_, err := d.writer.Exec(m)

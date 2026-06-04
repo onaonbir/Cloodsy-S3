@@ -15,6 +15,7 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/auth"
 	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/db"
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 	"github.com/onaonbir/Cloodsy-S3/storage"
 	"github.com/onaonbir/Cloodsy-S3/webhook"
@@ -39,11 +40,12 @@ var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 
 // Handler holds shared dependencies for all S3 handlers.
 type Handler struct {
-	DB         *db.DB
-	Storage    storage.Backend
-	Config     *config.Config
-	Logger     *slog.Logger
-	Dispatcher *webhook.Dispatcher
+	DB          *db.DB
+	Storage     storage.Backend
+	Config      *config.Config
+	Logger      *slog.Logger
+	Dispatcher  *webhook.Dispatcher
+	ImageWorker *imageutil.Worker // optional; set by server.Run when image.enabled
 }
 
 func New(database *db.DB, store storage.Backend, cfg *config.Config, logger *slog.Logger) *Handler {
@@ -197,6 +199,47 @@ func (h *Handler) checkBucketAccess(w http.ResponseWriter, r *http.Request, cred
 	}
 
 	return bucket, true
+}
+
+// authenticateOrPublic gates object reads (GET/HEAD) allowing anonymous access
+// when the target bucket is flagged public-read. It returns the resolved bucket
+// plus the credential (nil when anonymous). Signed access is unchanged: if any
+// auth material is present it is validated normally and ownership is enforced.
+//
+// Anonymous access is intentionally scoped to single-object reads only — it is
+// never wired into listings or writes, so a public bucket exposes object GETs
+// but not enumeration.
+func (h *Handler) authenticateOrPublic(w http.ResponseWriter, r *http.Request, bucketName string) (*db.Bucket, *db.BucketCredential, bool) {
+	hasAuth := r.Header.Get("Authorization") != "" || r.URL.Query().Get("X-Amz-Algorithm") != ""
+
+	if hasAuth {
+		cred, ok := h.authenticateRequest(w, r)
+		if !ok {
+			return nil, nil, false
+		}
+		bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
+		if !ok {
+			return nil, nil, false
+		}
+		return bucket, cred, true
+	}
+
+	// No credentials presented — permit only if the bucket is public-read.
+	bucket, err := h.DB.GetBucket(bucketName)
+	if err != nil {
+		h.Logger.Error("db error looking up bucket", "error", err)
+		s3err.WriteError(w, r, s3err.ErrInternalError)
+		return nil, nil, false
+	}
+	if bucket == nil {
+		s3err.WriteError(w, r, s3err.ErrNoSuchBucket)
+		return nil, nil, false
+	}
+	if !bucket.PublicRead {
+		s3err.WriteError(w, r, s3err.ErrAccessDenied)
+		return nil, nil, false
+	}
+	return bucket, nil, true
 }
 
 // checkWriteAccess returns false and writes AccessDenied if the credential is read-only.

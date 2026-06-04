@@ -7,20 +7,24 @@ import (
 	"path/filepath"
 	"regexp"
 	"strconv"
+
+	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 )
 
 var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 
 type bucketResponse struct {
-	ID          int64  `json:"id"`
-	Name        string `json:"name"`
-	QuotaBytes  int64  `json:"quota_bytes"`
-	Versioning  string `json:"versioning"`
-	StorageDir  string `json:"storage_dir"`
-	Objects     int64  `json:"objects"`
-	UsageBytes  int64  `json:"usage_bytes"`
-	Credentials int    `json:"credentials"`
-	CreatedAt   string `json:"created_at"`
+	ID            int64  `json:"id"`
+	Name          string `json:"name"`
+	QuotaBytes    int64  `json:"quota_bytes"`
+	Versioning    string `json:"versioning"`
+	StorageDir    string `json:"storage_dir"`
+	PublicRead    bool   `json:"public_read"`
+	WebDAVEnabled bool   `json:"webdav_enabled"`
+	Objects       int64  `json:"objects"`
+	UsageBytes    int64  `json:"usage_bytes"`
+	Credentials   int    `json:"credentials"`
+	CreatedAt     string `json:"created_at"`
 }
 
 func (h *Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
@@ -37,15 +41,17 @@ func (h *Handler) handleListBuckets(w http.ResponseWriter, r *http.Request) {
 		usage, _ := h.DB.GetBucketUsage(b.ID)
 		creds, _ := h.DB.ListCredentials(b.ID)
 		result = append(result, bucketResponse{
-			ID:          b.ID,
-			Name:        b.Name,
-			QuotaBytes:  b.QuotaBytes,
-			Versioning:  b.Versioning,
-			StorageDir:  b.StorageDir,
-			Objects:     objCount,
-			UsageBytes:  usage,
-			Credentials: len(creds),
-			CreatedAt:   b.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+			ID:            b.ID,
+			Name:          b.Name,
+			QuotaBytes:    b.QuotaBytes,
+			Versioning:    b.Versioning,
+			StorageDir:    b.StorageDir,
+			PublicRead:    b.PublicRead,
+			WebDAVEnabled: b.WebDAVEnabled,
+			Objects:       objCount,
+			UsageBytes:    usage,
+			Credentials:   len(creds),
+			CreatedAt:     b.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 		})
 	}
 
@@ -75,16 +81,18 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request, name s
 	}
 
 	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"id":           bucket.ID,
-		"name":         bucket.Name,
-		"quota_bytes":  bucket.QuotaBytes,
-		"versioning":   bucket.Versioning,
-		"storage_dir":  storageDir,
-		"storage_path": storagePath,
-		"objects":      objCount,
-		"usage_bytes":  usage,
-		"credentials":  len(creds),
-		"created_at":   bucket.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
+		"id":             bucket.ID,
+		"name":           bucket.Name,
+		"quota_bytes":    bucket.QuotaBytes,
+		"versioning":     bucket.Versioning,
+		"storage_dir":    storageDir,
+		"public_read":    bucket.PublicRead,
+		"webdav_enabled": bucket.WebDAVEnabled,
+		"storage_path":   storagePath,
+		"objects":        objCount,
+		"usage_bytes":    usage,
+		"credentials":    len(creds),
+		"created_at":     bucket.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
 	})
 }
 
@@ -354,5 +362,111 @@ func (h *Handler) handleSetVersioning(w http.ResponseWriter, r *http.Request, na
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"name":       name,
 		"versioning": req.Versioning,
+	})
+}
+
+func (h *Handler) handleSetPublicRead(w http.ResponseWriter, r *http.Request, name string) {
+	bucket, err := h.DB.GetBucket(name)
+	if err != nil || bucket == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	var req struct {
+		PublicRead bool `json:"public_read"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if err := h.DB.SetBucketPublicRead(name, req.PublicRead); err != nil {
+		h.Logger.Error("set public-read error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	h.Logger.Info("bucket public-read changed via admin API", "bucket", name, "public_read", req.PublicRead)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":        name,
+		"public_read": req.PublicRead,
+	})
+}
+
+func (h *Handler) handleSetWebDAV(w http.ResponseWriter, r *http.Request, name string) {
+	bucket, err := h.DB.GetBucket(name)
+	if err != nil || bucket == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	var req struct {
+		WebDAVEnabled bool `json:"webdav_enabled"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	if err := h.DB.SetBucketWebDAVEnabled(name, req.WebDAVEnabled); err != nil {
+		h.Logger.Error("set webdav error", "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
+		return
+	}
+
+	h.Logger.Info("bucket webdav changed via admin API", "bucket", name, "webdav_enabled", req.WebDAVEnabled)
+	writeJSON(w, http.StatusOK, map[string]interface{}{
+		"name":           name,
+		"webdav_enabled": req.WebDAVEnabled,
+	})
+}
+
+// handleReprocess regenerates optimized image variants for a bucket's existing
+// objects. It runs in the background and returns immediately so the GUI stays
+// responsive. Originals are never modified.
+func (h *Handler) handleReprocess(w http.ResponseWriter, r *http.Request, name string) {
+	bucket, err := h.DB.GetBucket(name)
+	if err != nil || bucket == nil {
+		writeJSON(w, http.StatusNotFound, map[string]string{"error": "bucket not found"})
+		return
+	}
+
+	quality := h.Config.Image.Quality
+	if quality <= 0 || quality > 100 {
+		quality = 75
+	}
+
+	go func(bucketID int64) {
+		marker := ""
+		processed := 0
+		for {
+			objects, _, truncated, next, err := h.DB.ListObjectsMeta(bucketID, "", marker, "", 1000)
+			if err != nil {
+				h.Logger.Error("reprocess list error", "bucket", name, "error", err)
+				return
+			}
+			for i := range objects {
+				m := objects[i]
+				if m.IsDeleteMarker || !imageutil.IsImageContentType(m.ContentType) {
+					continue
+				}
+				job := imageutil.Job{Bucket: name, Key: m.Key, VersionID: m.VersionID, ETag: m.ETag, ContentType: m.ContentType}
+				if err := imageutil.OptimizeOne(h.Storage, job, quality); err != nil {
+					h.Logger.Debug("reprocess optimize failed", "key", m.Key, "error", err)
+					continue
+				}
+				processed++
+			}
+			if !truncated {
+				break
+			}
+			marker = next
+		}
+		h.Logger.Info("reprocess complete", "bucket", name, "optimized", processed)
+	}(bucket.ID)
+
+	writeJSON(w, http.StatusAccepted, map[string]interface{}{
+		"name":   name,
+		"status": "reprocessing started",
 	})
 }
