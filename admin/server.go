@@ -17,8 +17,8 @@ func RunServer(handler *Handler, listen string, logger *slog.Logger) *http.Serve
 		Addr:              listen,
 		Handler:           mux,
 		ReadHeaderTimeout: 10 * time.Second,
-		ReadTimeout:       30 * time.Second,
-		WriteTimeout:      30 * time.Second,
+		ReadTimeout:       0,
+		WriteTimeout:      0,
 		IdleTimeout:       60 * time.Second,
 	}
 
