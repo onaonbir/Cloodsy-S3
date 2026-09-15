@@ -119,9 +119,8 @@ main() {
         fi
     fi
 
-    local TMP
     TMP=$(mktemp -d)
-    trap 'rm -rf "$TMP"' EXIT
+    trap 'rm -rf "${TMP:-}"' EXIT
 
     echo -e "  Downloading ${FILENAME}..."
     if ! curl -fsSL "${BASE_URL}/${FILENAME}" -o "${TMP}/${FILENAME}"; then
