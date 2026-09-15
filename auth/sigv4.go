@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,124 +17,151 @@ import (
 
 var multiSpaceRegex = regexp.MustCompile(`\s+`)
 
-// VerifySignature verifies the AWS Signature V4 of the request.
-func VerifySignature(r *http.Request, secretKey string, region string) error {
-	authHeader := r.Header.Get("Authorization")
-	if authHeader == "" {
-		return fmt.Errorf("missing Authorization header")
+// Typed verification errors so handlers can map them to the S3 error codes
+// AWS SDKs rely on (e.g. RequestTimeTooSkewed triggers clock correction).
+var (
+	ErrMissingAuth       = errors.New("missing Authorization header")
+	ErrMissingDate       = errors.New("missing X-Amz-Date header")
+	ErrInvalidDate       = errors.New("invalid X-Amz-Date format")
+	ErrTimeSkewed        = errors.New("request time too skewed")
+	ErrDateMismatch      = errors.New("credential date does not match X-Amz-Date")
+	ErrRegionMismatch    = errors.New("credential region does not match")
+	ErrServiceMismatch   = errors.New("credential service must be s3")
+	ErrMissingContentSHA = errors.New("missing x-amz-content-sha256 header")
+	ErrSignatureMismatch = errors.New("signature mismatch")
+	ErrPresignedExpired  = errors.New("presigned URL has expired")
+	ErrPresignedNotYet   = errors.New("presigned URL is not yet valid")
+)
+
+// MaxClockSkew mirrors AWS: requests dated more than 15 minutes away from
+// server time are rejected.
+const MaxClockSkew = 15 * time.Minute
+
+// VerifySignature verifies the AWS Signature V4 of the request. auth may be
+// the already-parsed Authorization header (nil parses it again); on success
+// its AmzDate/Scope fields are populated.
+func VerifySignature(r *http.Request, secretKey string, region string, auth *SigV4Auth) error {
+	if auth == nil {
+		authHeader := r.Header.Get("Authorization")
+		if authHeader == "" {
+			return ErrMissingAuth
+		}
+		var err error
+		auth, err = ParseAuthorizationHeader(authHeader)
+		if err != nil {
+			return err
+		}
 	}
 
-	auth, err := ParseAuthorizationHeader(authHeader)
-	if err != nil {
-		return err
-	}
-
-	// Check time skew
 	amzDate := r.Header.Get("X-Amz-Date")
 	if amzDate == "" {
-		return fmt.Errorf("missing X-Amz-Date header")
+		// SigV4 also allows the standard Date header.
+		if d := r.Header.Get("Date"); d != "" {
+			if t, perr := http.ParseTime(d); perr == nil {
+				amzDate = t.UTC().Format(sigV4TimeFormat)
+			}
+		}
+	}
+	if amzDate == "" {
+		return ErrMissingDate
 	}
 
 	reqTime, err := time.Parse(sigV4TimeFormat, amzDate)
 	if err != nil {
-		return fmt.Errorf("invalid X-Amz-Date format")
+		return ErrInvalidDate
 	}
 
-	if time.Since(reqTime).Abs() > 5*time.Minute {
-		return fmt.Errorf("request time too skewed")
+	if time.Since(reqTime).Abs() > MaxClockSkew {
+		return ErrTimeSkewed
 	}
 
-	// Validate credential date matches X-Amz-Date
 	dateStamp := amzDate[:8] // YYYYMMDD from X-Amz-Date
 	if auth.Date != dateStamp {
-		return fmt.Errorf("credential date does not match X-Amz-Date")
+		return ErrDateMismatch
 	}
-
-	// Validate credential region matches server region
 	if auth.Region != region {
-		return fmt.Errorf("credential region does not match")
+		return ErrRegionMismatch
 	}
-
-	// Validate credential service is "s3"
 	if auth.Service != "s3" {
-		return fmt.Errorf("credential service must be s3")
+		return ErrServiceMismatch
 	}
-
-	// Require X-Amz-Content-Sha256 header
 	if r.Header.Get("X-Amz-Content-Sha256") == "" {
-		return fmt.Errorf("missing x-amz-content-sha256 header")
+		return ErrMissingContentSHA
 	}
 
-	// Build canonical request
-	canonicalRequest := buildCanonicalRequest(r, auth.SignedHeaders)
+	canonicalRequest := buildCanonicalRequest(r, auth.SignedHeaders, r.Header.Get("X-Amz-Content-Sha256"), r.URL.Query())
 
-	// Build string to sign
 	scope := dateStamp + "/" + region + "/s3/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hashSHA256([]byte(canonicalRequest))
 
-	// Calculate signature
-	signingKey := deriveSigningKey(secretKey, dateStamp, region, "s3")
+	signingKey := DeriveSigningKey(secretKey, dateStamp, region, "s3")
 	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
 	if !hmac.Equal([]byte(expectedSig), []byte(auth.Signature)) {
-		return fmt.Errorf("signature mismatch")
+		return ErrSignatureMismatch
 	}
 
+	auth.AmzDate = amzDate
+	auth.Scope = scope
 	return nil
 }
 
-func buildCanonicalRequest(r *http.Request, signedHeaders []string) string {
-	// HTTP method
+// buildCanonicalRequest assembles the SigV4 canonical request. query is the
+// query string to canonicalize (presigned verification strips X-Amz-Signature).
+func buildCanonicalRequest(r *http.Request, signedHeaders []string, payloadHash string, query url.Values) string {
 	method := r.Method
 
-	// Canonical URI
 	canonicalURI := r.URL.Path
 	if canonicalURI == "" {
 		canonicalURI = "/"
 	}
-	// URI-encode each path segment
 	canonicalURI = canonicalURIEncode(canonicalURI)
 
-	// Canonical query string
-	canonicalQueryString := canonicalQueryEncode(r.URL.Query())
+	canonicalQueryString := canonicalQueryEncode(query)
 
-	// Canonical headers
-	sort.Strings(signedHeaders)
+	sorted := make([]string, len(signedHeaders))
+	for i, h := range signedHeaders {
+		sorted[i] = strings.ToLower(h)
+	}
+	sort.Strings(sorted)
+
 	var canonicalHeaders strings.Builder
-	for _, h := range signedHeaders {
-		val := strings.TrimSpace(r.Header.Get(h))
-		if strings.EqualFold(h, "host") {
+	for _, h := range sorted {
+		var val string
+		if h == "host" {
 			val = r.Host
 			if val == "" {
 				val = r.Header.Get("Host")
 			}
+		} else {
+			// Multiple values of the same header are joined with commas per spec.
+			vals := r.Header.Values(h)
+			trimmed := make([]string, len(vals))
+			for i, v := range vals {
+				trimmed[i] = strings.TrimSpace(v)
+			}
+			val = strings.Join(trimmed, ",")
 		}
-		// Collapse sequential whitespace into a single space per AWS SigV4 spec
-		val = multiSpaceRegex.ReplaceAllString(val, " ")
-		canonicalHeaders.WriteString(strings.ToLower(h))
+		val = multiSpaceRegex.ReplaceAllString(strings.TrimSpace(val), " ")
+		canonicalHeaders.WriteString(h)
 		canonicalHeaders.WriteString(":")
 		canonicalHeaders.WriteString(val)
 		canonicalHeaders.WriteString("\n")
 	}
 
-	signedHeadersStr := strings.Join(signedHeaders, ";")
-
-	// Payload hash
-	payloadHash := r.Header.Get("X-Amz-Content-Sha256")
-
 	return method + "\n" +
 		canonicalURI + "\n" +
 		canonicalQueryString + "\n" +
 		canonicalHeaders.String() + "\n" +
-		signedHeadersStr + "\n" +
+		strings.Join(sorted, ";") + "\n" +
 		payloadHash
 }
 
 func canonicalURIEncode(uri string) string {
 	parts := strings.Split(uri, "/")
-	var encoded []string
-	for _, p := range parts {
-		encoded = append(encoded, uriEncode(p, false))
+	encoded := make([]string, len(parts))
+	for i, p := range parts {
+		encoded[i] = uriEncode(p, false)
 	}
 	return strings.Join(encoded, "/")
 }
@@ -147,7 +175,7 @@ func canonicalQueryEncode(query url.Values) string {
 
 	var pairs []string
 	for _, k := range keys {
-		vals := query[k]
+		vals := append([]string(nil), query[k]...)
 		sort.Strings(vals)
 		for _, v := range vals {
 			pairs = append(pairs, uriEncode(k, true)+"="+uriEncode(v, true))
@@ -180,18 +208,24 @@ func hashSHA256(data []byte) string {
 	return hex.EncodeToString(h[:])
 }
 
+// HashSHA256Hex returns the lower-case hex SHA-256 of data.
+func HashSHA256Hex(data []byte) string { return hashSHA256(data) }
+
 func hmacSHA256(key, data []byte) []byte {
 	h := hmac.New(sha256.New, key)
 	h.Write(data)
 	return h.Sum(nil)
 }
 
-func deriveSigningKey(secret, dateStamp, region, service string) []byte {
+// HMACSHA256 is exported for streaming (aws-chunked) signature verification.
+func HMACSHA256(key, data []byte) []byte { return hmacSHA256(key, data) }
+
+// DeriveSigningKey derives the SigV4 signing key for a date/region/service.
+func DeriveSigningKey(secret, dateStamp, region, service string) []byte {
 	kDate := hmacSHA256([]byte("AWS4"+secret), []byte(dateStamp))
 	kRegion := hmacSHA256(kDate, []byte(region))
 	kService := hmacSHA256(kRegion, []byte(service))
-	kSigning := hmacSHA256(kService, []byte("aws4_request"))
-	return kSigning
+	return hmacSHA256(kService, []byte("aws4_request"))
 }
 
 // VerifyPresignedSignature verifies the signature of a presigned URL request.
@@ -207,83 +241,35 @@ func VerifyPresignedSignature(r *http.Request, secretKey string, region string, 
 	}
 	amzDate := query.Get("X-Amz-Date")
 
-	// Validate credential date matches X-Amz-Date
 	dateStamp := reqTime.Format("20060102")
 	if auth.Date != dateStamp {
-		return fmt.Errorf("credential date does not match X-Amz-Date")
+		return ErrDateMismatch
 	}
-
-	// Validate credential region
 	if auth.Region != region {
-		return fmt.Errorf("credential region does not match")
+		return ErrRegionMismatch
 	}
 
-	// Build canonical request for presigned URL
-	canonicalRequest := buildPresignedCanonicalRequest(r, auth.SignedHeaders)
+	// Canonical query: every param except X-Amz-Signature; payload is UNSIGNED.
+	filtered := make(url.Values, len(query))
+	for k, v := range query {
+		if k != "X-Amz-Signature" {
+			filtered[k] = v
+		}
+	}
+	canonicalRequest := buildCanonicalRequest(r, auth.SignedHeaders, "UNSIGNED-PAYLOAD", filtered)
 
 	scope := dateStamp + "/" + region + "/s3/aws4_request"
 	stringToSign := "AWS4-HMAC-SHA256\n" + amzDate + "\n" + scope + "\n" + hashSHA256([]byte(canonicalRequest))
 
-	signingKey := deriveSigningKey(secretKey, dateStamp, region, "s3")
+	signingKey := DeriveSigningKey(secretKey, dateStamp, region, "s3")
 	expectedSig := hex.EncodeToString(hmacSHA256(signingKey, []byte(stringToSign)))
 
 	if !hmac.Equal([]byte(expectedSig), []byte(auth.Signature)) {
-		return fmt.Errorf("signature mismatch")
+		return ErrSignatureMismatch
 	}
-
+	auth.AmzDate = amzDate
+	auth.Scope = scope
 	return nil
-}
-
-// buildPresignedCanonicalRequest builds the canonical request for presigned URL verification.
-// The key difference from header-based auth: query params include all X-Amz-* except X-Amz-Signature,
-// and the payload hash is always "UNSIGNED-PAYLOAD".
-func buildPresignedCanonicalRequest(r *http.Request, signedHeaders []string) string {
-	method := r.Method
-
-	canonicalURI := r.URL.Path
-	if canonicalURI == "" {
-		canonicalURI = "/"
-	}
-	canonicalURI = canonicalURIEncode(canonicalURI)
-
-	// Canonical query string: include all query params EXCEPT X-Amz-Signature
-	filteredQuery := make(url.Values)
-	for k, v := range r.URL.Query() {
-		if k != "X-Amz-Signature" {
-			filteredQuery[k] = v
-		}
-	}
-	canonicalQueryString := canonicalQueryEncode(filteredQuery)
-
-	// Canonical headers
-	sort.Strings(signedHeaders)
-	var canonicalHeaders strings.Builder
-	for _, h := range signedHeaders {
-		val := strings.TrimSpace(r.Header.Get(h))
-		if strings.EqualFold(h, "host") {
-			val = r.Host
-			if val == "" {
-				val = r.Header.Get("Host")
-			}
-		}
-		val = multiSpaceRegex.ReplaceAllString(val, " ")
-		canonicalHeaders.WriteString(strings.ToLower(h))
-		canonicalHeaders.WriteString(":")
-		canonicalHeaders.WriteString(val)
-		canonicalHeaders.WriteString("\n")
-	}
-
-	signedHeadersStr := strings.Join(signedHeaders, ";")
-
-	// Presigned URLs always use UNSIGNED-PAYLOAD
-	payloadHash := "UNSIGNED-PAYLOAD"
-
-	return method + "\n" +
-		canonicalURI + "\n" +
-		canonicalQueryString + "\n" +
-		canonicalHeaders.String() + "\n" +
-		signedHeadersStr + "\n" +
-		payloadHash
 }
 
 // HashPayload computes SHA256 of request body for signature verification.

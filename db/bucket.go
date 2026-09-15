@@ -1,7 +1,9 @@
 package db
 
 import (
+	"context"
 	"database/sql"
+	"strings"
 	"time"
 )
 
@@ -180,6 +182,20 @@ func (d *DB) BucketHasObjects(bucketID int64) (bool, error) {
 	return true, nil
 }
 
+// BucketHasAnyRows reports whether any object row (including noncurrent
+// versions and delete markers) exists for the bucket.
+func (d *DB) BucketHasAnyRows(bucketID int64) (bool, error) {
+	var one int
+	err := d.reader.QueryRow("SELECT 1 FROM objects WHERE bucket_id = ? LIMIT 1", bucketID).Scan(&one)
+	if err == sql.ErrNoRows {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
 // Credential operations
 
 func (d *DB) CreateCredential(bucketID int64, name, accessKey, secretKey, permission string) (*BucketCredential, error) {
@@ -307,32 +323,71 @@ func (d *DB) SetBucketWebDAVEnabled(name string, enabled bool) error {
 // Lifecycle rule operations
 
 type LifecycleRule struct {
-	ID             int64
-	BucketName     string
-	Name           string
-	Prefix         string
-	ExpirationDays int
-	CreatedAt      time.Time
+	ID                  int64
+	BucketName          string
+	Name                string
+	Prefix              string
+	Status              string // "Enabled" or "Disabled"
+	ExpirationDays      int    // 0 = no current-version expiration
+	NoncurrentDays      int    // 0 = no noncurrent-version expiration
+	AbortMultipartDays  int    // 0 = no incomplete multipart cleanup
+	ExpireDeleteMarkers bool   // remove orphan delete markers
+	CreatedAt           time.Time
 }
 
+const lifecycleColumns = "id, bucket_name, name, prefix, status, expiration_days, noncurrent_days, abort_multipart_days, expire_delete_markers, created_at"
+
+func scanLifecycle(sc interface{ Scan(...interface{}) error }, r *LifecycleRule) error {
+	return sc.Scan(&r.ID, &r.BucketName, &r.Name, &r.Prefix, &r.Status, &r.ExpirationDays, &r.NoncurrentDays, &r.AbortMultipartDays, &r.ExpireDeleteMarkers, &r.CreatedAt)
+}
+
+const upsertLifecycleSQL = `
+	INSERT INTO lifecycle_rules (bucket_name, name, prefix, status, expiration_days, noncurrent_days, abort_multipart_days, expire_delete_markers)
+	VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+	ON CONFLICT(bucket_name, prefix) DO UPDATE SET
+		name = excluded.name,
+		status = excluded.status,
+		expiration_days = excluded.expiration_days,
+		noncurrent_days = excluded.noncurrent_days,
+		abort_multipart_days = excluded.abort_multipart_days,
+		expire_delete_markers = excluded.expire_delete_markers`
+
+// PutLifecycleRule upserts a simple expiration rule (CLI / admin helper).
 func (d *DB) PutLifecycleRule(bucketName, name, prefix string, expirationDays int) error {
+	return d.PutLifecycleRuleFull(LifecycleRule{BucketName: bucketName, Name: name, Prefix: prefix, Status: "Enabled", ExpirationDays: expirationDays})
+}
+
+// PutLifecycleRuleFull upserts one rule with all supported actions.
+func (d *DB) PutLifecycleRuleFull(r LifecycleRule) error {
+	if r.Status == "" {
+		r.Status = "Enabled"
+	}
 	return d.withRetry(func() error {
-		_, err := d.writer.Exec(`
-			INSERT INTO lifecycle_rules (bucket_name, name, prefix, expiration_days)
-			VALUES (?, ?, ?, ?)
-			ON CONFLICT(bucket_name, prefix) DO UPDATE SET
-				expiration_days = excluded.expiration_days,
-				name = excluded.name
-		`, bucketName, name, prefix, expirationDays)
+		_, err := d.writer.Exec(upsertLifecycleSQL, r.BucketName, r.Name, r.Prefix, r.Status, r.ExpirationDays, r.NoncurrentDays, r.AbortMultipartDays, r.ExpireDeleteMarkers)
 		return err
 	})
 }
 
+// ReplaceLifecycleRules atomically replaces every rule of a bucket.
+func (d *DB) ReplaceLifecycleRules(bucketName string, rules []LifecycleRule) error {
+	return d.WriteTx(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec("DELETE FROM lifecycle_rules WHERE bucket_name = ?", bucketName); err != nil {
+			return err
+		}
+		for _, r := range rules {
+			if r.Status == "" {
+				r.Status = "Enabled"
+			}
+			if _, err := tx.Exec(upsertLifecycleSQL, bucketName, r.Name, r.Prefix, r.Status, r.ExpirationDays, r.NoncurrentDays, r.AbortMultipartDays, r.ExpireDeleteMarkers); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (d *DB) GetLifecycleRules(bucketName string) ([]LifecycleRule, error) {
-	rows, err := d.reader.Query(`
-		SELECT id, bucket_name, name, prefix, expiration_days, created_at
-		FROM lifecycle_rules WHERE bucket_name = ? ORDER BY prefix
-	`, bucketName)
+	rows, err := d.reader.Query(`SELECT `+lifecycleColumns+` FROM lifecycle_rules WHERE bucket_name = ? ORDER BY prefix`, bucketName)
 	if err != nil {
 		return nil, err
 	}
@@ -341,7 +396,7 @@ func (d *DB) GetLifecycleRules(bucketName string) ([]LifecycleRule, error) {
 	var rules []LifecycleRule
 	for rows.Next() {
 		var r LifecycleRule
-		if err := rows.Scan(&r.ID, &r.BucketName, &r.Name, &r.Prefix, &r.ExpirationDays, &r.CreatedAt); err != nil {
+		if err := scanLifecycle(rows, &r); err != nil {
 			return nil, err
 		}
 		rules = append(rules, r)
@@ -364,7 +419,7 @@ func (d *DB) DeleteLifecycleRuleByPrefix(bucketName, prefix string) error {
 }
 
 func (d *DB) GetAllLifecycleRules() ([]LifecycleRule, error) {
-	rows, err := d.reader.Query(`SELECT id, bucket_name, name, prefix, expiration_days, created_at FROM lifecycle_rules`)
+	rows, err := d.reader.Query(`SELECT ` + lifecycleColumns + ` FROM lifecycle_rules`)
 	if err != nil {
 		return nil, err
 	}
@@ -373,7 +428,7 @@ func (d *DB) GetAllLifecycleRules() ([]LifecycleRule, error) {
 	var rules []LifecycleRule
 	for rows.Next() {
 		var r LifecycleRule
-		if err := rows.Scan(&r.ID, &r.BucketName, &r.Name, &r.Prefix, &r.ExpirationDays, &r.CreatedAt); err != nil {
+		if err := scanLifecycle(rows, &r); err != nil {
 			return nil, err
 		}
 		rules = append(rules, r)
@@ -381,7 +436,8 @@ func (d *DB) GetAllLifecycleRules() ([]LifecycleRule, error) {
 	return rules, rows.Err()
 }
 
-// GetMatchingLifecycleRule returns the best matching lifecycle rule for a key in a bucket.
+// GetMatchingLifecycleRule returns the most specific enabled expiration rule
+// for a key in a bucket (used for the x-amz-expiration header).
 func (d *DB) GetMatchingLifecycleRule(bucketName, key string) (*LifecycleRule, error) {
 	rules, err := d.GetLifecycleRules(bucketName)
 	if err != nil {
@@ -389,7 +445,10 @@ func (d *DB) GetMatchingLifecycleRule(bucketName, key string) (*LifecycleRule, e
 	}
 	var best *LifecycleRule
 	for i, r := range rules {
-		if key == r.Prefix || len(r.Prefix) == 0 || (len(key) >= len(r.Prefix) && key[:len(r.Prefix)] == r.Prefix) {
+		if r.Status != "Enabled" || r.ExpirationDays <= 0 {
+			continue
+		}
+		if strings.HasPrefix(key, r.Prefix) {
 			if best == nil || len(r.Prefix) > len(best.Prefix) {
 				best = &rules[i]
 			}
@@ -468,6 +527,26 @@ func (d *DB) DeleteWebhook(id int64) error {
 	})
 }
 
+// ReplaceWebhooks atomically replaces every webhook of a bucket.
+func (d *DB) ReplaceWebhooks(bucketName string, hooks []BucketWebhook) error {
+	return d.WriteTx(context.Background(), func(tx *sql.Tx) error {
+		if _, err := tx.Exec("DELETE FROM bucket_webhooks WHERE bucket_name = ?", bucketName); err != nil {
+			return err
+		}
+		for _, h := range hooks {
+			et := h.EventTypes
+			if et == "" {
+				et = "*"
+			}
+			if _, err := tx.Exec(`INSERT INTO bucket_webhooks (bucket_name, name, url, event_types, secret, active) VALUES (?, ?, ?, ?, ?, ?)`,
+				bucketName, h.Name, h.URL, et, h.Secret, true); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+}
+
 func (d *DB) DeleteAllWebhooks(bucketName string) error {
 	return d.withRetry(func() error {
 		_, err := d.writer.Exec("DELETE FROM bucket_webhooks WHERE bucket_name = ?", bucketName)
@@ -494,4 +573,22 @@ func (d *DB) GetActiveWebhooksForBucket(bucketName string) ([]BucketWebhook, err
 		hooks = append(hooks, h)
 	}
 	return hooks, rows.Err()
+}
+
+// ListBucketNames returns every bucket name.
+func (d *DB) ListBucketNames() ([]string, error) {
+	rows, err := d.reader.Query("SELECT name FROM buckets ORDER BY name")
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var names []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			return nil, err
+		}
+		names = append(names, n)
+	}
+	return names, rows.Err()
 }

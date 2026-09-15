@@ -1,9 +1,11 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 	"strconv"
+
+	"github.com/onaonbir/Cloodsy-S3/httpx"
+	"github.com/onaonbir/Cloodsy-S3/webhook"
 )
 
 func (h *Handler) handleListWebhooks(w http.ResponseWriter, r *http.Request, bucketName string) {
@@ -48,13 +50,23 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request, bu
 		EventTypes string `json:"event_types"`
 		Secret     string `json:"secret"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
 	if req.URL == "" {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required"})
+		return
+	}
+	if len(req.URL) > 2048 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url too long"})
+		return
+	}
+	// Admins may point hooks at internal services (allowPrivate=true), but the
+	// scheme must still be http/https so the dispatcher never dials file:,
+	// gopher: or similar.
+	if err := webhook.ValidateURL(req.URL, true); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": err.Error()})
 		return
 	}
 
@@ -65,7 +77,7 @@ func (h *Handler) handleCreateWebhook(w http.ResponseWriter, r *http.Request, bu
 		return
 	}
 
-	h.Logger.Info("webhook created via admin API", "bucket", bucketName, "name", req.Name, "url", req.URL)
+	h.Logger.Info("webhook created via admin API", "bucket", bucketName, "name", httpx.SanitizeLog(req.Name), "url", httpx.SanitizeLog(req.URL))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"id":          hook.ID,
 		"name":        hook.Name,

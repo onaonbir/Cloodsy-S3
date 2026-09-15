@@ -3,13 +3,19 @@ package webhook
 import (
 	"bytes"
 	"crypto/hmac"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
+	"net/url"
+	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/onaonbir/Cloodsy-S3/db"
@@ -34,25 +40,33 @@ type s3EventPayload struct {
 type s3Record struct {
 	EventVersion string   `json:"eventVersion"`
 	EventSource  string   `json:"eventSource"`
+	AwsRegion    string   `json:"awsRegion"`
 	EventTime    string   `json:"eventTime"`
 	EventName    string   `json:"eventName"`
 	S3           s3Detail `json:"s3"`
 }
 
 type s3Detail struct {
-	Bucket s3Bucket `json:"bucket"`
-	Object s3Object `json:"object"`
+	SchemaVersion   string   `json:"s3SchemaVersion"`
+	ConfigurationID string   `json:"configurationId"`
+	Bucket          s3Bucket `json:"bucket"`
+	Object          s3Object `json:"object"`
 }
 
 type s3Bucket struct {
 	Name string `json:"name"`
+	ARN  string `json:"arn"`
 }
 
 type s3Object struct {
-	Key       string `json:"key"`
-	Size      int64  `json:"size"`
-	ETag      string `json:"eTag"`
-	VersionID string `json:"versionId,omitempty"`
+	// Key is the raw object key (kept unencoded for backward compatibility
+	// with existing consumers); UrlEncodedKey follows the AWS format.
+	Key           string `json:"key"`
+	URLEncodedKey string `json:"urlEncodedKey"`
+	Size          int64  `json:"size"`
+	ETag          string `json:"eTag"`
+	VersionID     string `json:"versionId,omitempty"`
+	Sequencer     string `json:"sequencer"`
 }
 
 // Dispatcher handles async webhook delivery.
@@ -62,7 +76,10 @@ type Dispatcher struct {
 	workers int
 	client  *http.Client
 	logger  *slog.Logger
+	region  string
 	done    chan struct{}
+	mu      sync.RWMutex
+	closed  bool
 }
 
 // NewDispatcher creates a new webhook dispatcher.
@@ -76,8 +93,12 @@ func NewDispatcher(database *db.DB, workers int, logger *slog.Logger) *Dispatche
 		workers: workers,
 		client: &http.Client{
 			Timeout: 10 * time.Second,
+			CheckRedirect: func(req *http.Request, via []*http.Request) error {
+				return http.ErrUseLastResponse // never follow redirects (SSRF hygiene)
+			},
 		},
 		logger: logger,
+		region: "us-east-1",
 		done:   make(chan struct{}),
 	}
 	for i := 0; i < workers; i++ {
@@ -86,8 +107,17 @@ func NewDispatcher(database *db.DB, workers int, logger *slog.Logger) *Dispatche
 	return d
 }
 
-// Emit queues an event for delivery. Non-blocking; drops event if queue is full.
+// SetRegion sets the awsRegion reported in payloads.
+func (d *Dispatcher) SetRegion(region string) { d.region = region }
+
+// Emit queues an event for delivery. Non-blocking; drops the event if the
+// queue is full or the dispatcher has been stopped.
 func (d *Dispatcher) Emit(event Event) {
+	d.mu.RLock()
+	defer d.mu.RUnlock()
+	if d.closed {
+		return
+	}
 	select {
 	case d.queue <- event:
 	default:
@@ -95,10 +125,16 @@ func (d *Dispatcher) Emit(event Event) {
 	}
 }
 
-// Stop gracefully shuts down the dispatcher.
+// Stop gracefully shuts down the dispatcher and waits for workers to drain.
 func (d *Dispatcher) Stop() {
+	d.mu.Lock()
+	if d.closed {
+		d.mu.Unlock()
+		return
+	}
+	d.closed = true
 	close(d.queue)
-	// Wait for workers to drain
+	d.mu.Unlock()
 	for i := 0; i < d.workers; i++ {
 		<-d.done
 	}
@@ -143,20 +179,31 @@ func matchEvent(pattern, eventType string) bool {
 	return false
 }
 
+func newDeliveryID() string {
+	b := make([]byte, 16)
+	rand.Read(b)
+	return hex.EncodeToString(b)
+}
+
 func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 	payload := s3EventPayload{
 		Records: []s3Record{{
 			EventVersion: "2.1",
 			EventSource:  "cloodsy:s3",
-			EventTime:    event.Timestamp.Format(time.RFC3339),
+			AwsRegion:    d.region,
+			EventTime:    event.Timestamp.UTC().Format(time.RFC3339),
 			EventName:    event.EventType,
 			S3: s3Detail{
-				Bucket: s3Bucket{Name: event.BucketName},
+				SchemaVersion:   "1.0",
+				ConfigurationID: hook.Name,
+				Bucket:          s3Bucket{Name: event.BucketName, ARN: "arn:aws:s3:::" + event.BucketName},
 				Object: s3Object{
-					Key:       event.Key,
-					Size:      event.Size,
-					ETag:      event.ETag,
-					VersionID: event.VersionID,
+					Key:           event.Key,
+					URLEncodedKey: strings.ReplaceAll(url.QueryEscape(event.Key), "%2F", "/"),
+					Size:          event.Size,
+					ETag:          strings.Trim(event.ETag, "\""),
+					VersionID:     event.VersionID,
+					Sequencer:     fmt.Sprintf("%016X", event.Timestamp.UnixNano()),
 				},
 			},
 		}},
@@ -167,6 +214,7 @@ func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 		d.logger.Error("failed to marshal webhook payload", "error", err)
 		return
 	}
+	deliveryID := newDeliveryID()
 
 	// Retry with exponential backoff: 1s, 2s, 4s
 	backoff := time.Second
@@ -182,13 +230,23 @@ func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 			return
 		}
 		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("User-Agent", "Cloodsy-S3-Webhook/1.0")
+		req.Header.Set("X-Cloodsy-Delivery", deliveryID)
+		req.Header.Set("X-Cloodsy-Event", event.EventType)
+		req.Header.Set("X-Cloodsy-Timestamp", strconv.FormatInt(event.Timestamp.Unix(), 10))
 
-		// HMAC signing
+		// HMAC signing over the body (X-Cloodsy-Signature) plus a replay-resistant
+		// variant that also covers the timestamp (X-Cloodsy-Signature-256).
 		if hook.Secret != "" {
 			mac := hmac.New(sha256.New, []byte(hook.Secret))
 			mac.Write(body)
-			sig := hex.EncodeToString(mac.Sum(nil))
-			req.Header.Set("X-Cloodsy-Signature", fmt.Sprintf("sha256=%s", sig))
+			req.Header.Set("X-Cloodsy-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+
+			mac2 := hmac.New(sha256.New, []byte(hook.Secret))
+			mac2.Write([]byte(strconv.FormatInt(event.Timestamp.Unix(), 10)))
+			mac2.Write([]byte("."))
+			mac2.Write(body)
+			req.Header.Set("X-Cloodsy-Signature-256", "t="+strconv.FormatInt(event.Timestamp.Unix(), 10)+",v1="+hex.EncodeToString(mac2.Sum(nil)))
 		}
 
 		resp, err := d.client.Do(req)
@@ -205,4 +263,46 @@ func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 	}
 
 	d.logger.Error("webhook delivery failed after retries", "url", hook.URL, "bucket", hook.BucketName)
+}
+
+// ValidateURL checks a webhook destination. Only http/https are accepted.
+// When allowPrivate is false, loopback, link-local (including the cloud
+// metadata address) and private networks are rejected to prevent SSRF from
+// bucket-credential holders.
+func ValidateURL(raw string, allowPrivate bool) error {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return fmt.Errorf("invalid webhook url: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("webhook url must use http or https")
+	}
+	host := u.Hostname()
+	if host == "" {
+		return errors.New("webhook url must have a host")
+	}
+	if allowPrivate {
+		return nil
+	}
+	if strings.EqualFold(host, "localhost") || strings.HasSuffix(strings.ToLower(host), ".localhost") {
+		return errors.New("webhook url may not target localhost")
+	}
+	ips := []net.IP{}
+	if ip := net.ParseIP(host); ip != nil {
+		ips = append(ips, ip)
+	} else {
+		resolved, err := net.LookupIP(host)
+		if err != nil {
+			// Unresolvable now (offline install, DNS hiccup): accept; delivery
+			// will simply fail until the name resolves.
+			return nil
+		}
+		ips = resolved
+	}
+	for _, ip := range ips {
+		if ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || ip.IsPrivate() || ip.IsUnspecified() {
+			return errors.New("webhook url may not target private or link-local addresses")
+		}
+	}
+	return nil
 }

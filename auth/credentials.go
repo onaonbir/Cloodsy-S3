@@ -37,7 +37,9 @@ func GenerateSecretKey() (string, error) {
 	return string(key), nil
 }
 
-// ParseAuthHeader parses the Authorization header and returns the access key and other SigV4 components.
+// SigV4Auth holds the parsed components of a SigV4 Authorization header or
+// presigned query string. AmzDate and Scope are filled in after successful
+// verification so streaming (aws-chunked) bodies can be verified too.
 type SigV4Auth struct {
 	AccessKey     string
 	SignedHeaders []string
@@ -46,6 +48,8 @@ type SigV4Auth struct {
 	Service       string
 	Date          string
 	Credential    string
+	AmzDate       string
+	Scope         string
 }
 
 const (
@@ -56,7 +60,7 @@ const (
 func validatePresignedExpiry(q url.Values) (time.Time, error) {
 	amzDate := q.Get("X-Amz-Date")
 	if amzDate == "" {
-		return time.Time{}, fmt.Errorf("missing X-Amz-Date")
+		return time.Time{}, ErrMissingDate
 	}
 
 	expiresStr := q.Get("X-Amz-Expires")
@@ -71,10 +75,14 @@ func validatePresignedExpiry(q url.Values) (time.Time, error) {
 
 	reqTime, err := time.Parse(sigV4TimeFormat, amzDate)
 	if err != nil {
-		return time.Time{}, fmt.Errorf("invalid X-Amz-Date format")
+		return time.Time{}, ErrInvalidDate
 	}
-	if time.Since(reqTime) > time.Duration(expires)*time.Second {
-		return time.Time{}, fmt.Errorf("presigned URL has expired")
+	now := time.Now()
+	if reqTime.After(now.Add(MaxClockSkew)) {
+		return time.Time{}, ErrPresignedNotYet
+	}
+	if now.Sub(reqTime) > time.Duration(expires)*time.Second {
+		return time.Time{}, ErrPresignedExpired
 	}
 
 	return reqTime, nil
@@ -89,8 +97,9 @@ func ParseAuthorizationHeader(header string) (*SigV4Auth, error) {
 	parts := header[len("AWS4-HMAC-SHA256 "):]
 	auth := &SigV4Auth{}
 
-	for _, part := range strings.Split(parts, ", ") {
-		kv := strings.SplitN(part, "=", 2)
+	// Components are comma separated; whitespace around commas is optional.
+	for _, part := range strings.Split(parts, ",") {
+		kv := strings.SplitN(strings.TrimSpace(part), "=", 2)
 		if len(kv) != 2 {
 			continue
 		}
@@ -117,31 +126,28 @@ func ParseAuthorizationHeader(header string) (*SigV4Auth, error) {
 	if auth.AccessKey == "" || auth.Date == "" || auth.Region == "" || auth.Service == "" {
 		return nil, fmt.Errorf("incomplete credential scope")
 	}
-
 	if auth.Service != "s3" {
-		return nil, fmt.Errorf("invalid service in credential: expected s3")
+		return nil, ErrServiceMismatch
 	}
-
 	if len(auth.SignedHeaders) == 0 {
 		return nil, fmt.Errorf("missing signed headers")
 	}
-
 	if auth.Signature == "" {
 		return nil, fmt.Errorf("missing signature")
 	}
-
-	hasHost := false
-	for _, h := range auth.SignedHeaders {
-		if strings.EqualFold(h, "host") {
-			hasHost = true
-			break
-		}
-	}
-	if !hasHost {
+	if !hasHost(auth.SignedHeaders) {
 		return nil, fmt.Errorf("missing required signed header: host")
 	}
-
 	return auth, nil
+}
+
+func hasHost(signed []string) bool {
+	for _, h := range signed {
+		if strings.EqualFold(h, "host") {
+			return true
+		}
+	}
+	return false
 }
 
 // ParsePresignedQuery parses presigned URL query parameters into a SigV4Auth struct.
@@ -155,17 +161,14 @@ func ParsePresignedQuery(q url.Values) (*SigV4Auth, error) {
 	if credential == "" {
 		return nil, fmt.Errorf("missing X-Amz-Credential")
 	}
-
 	signature := q.Get("X-Amz-Signature")
 	if signature == "" {
 		return nil, fmt.Errorf("missing X-Amz-Signature")
 	}
-
 	signedHeaders := q.Get("X-Amz-SignedHeaders")
 	if signedHeaders == "" {
 		return nil, fmt.Errorf("missing X-Amz-SignedHeaders")
 	}
-
 	if _, err := validatePresignedExpiry(q); err != nil {
 		return nil, err
 	}
@@ -184,22 +187,11 @@ func ParsePresignedQuery(q url.Values) (*SigV4Auth, error) {
 		SignedHeaders: strings.Split(signedHeaders, ";"),
 		Signature:     signature,
 	}
-
 	if auth.Service != "s3" {
-		return nil, fmt.Errorf("invalid service in credential: expected s3")
+		return nil, ErrServiceMismatch
 	}
-
-	// Validate "host" is in signed headers
-	hasHost := false
-	for _, h := range auth.SignedHeaders {
-		if strings.EqualFold(h, "host") {
-			hasHost = true
-			break
-		}
-	}
-	if !hasHost {
+	if !hasHost(auth.SignedHeaders) {
 		return nil, fmt.Errorf("missing required signed header: host")
 	}
-
 	return auth, nil
 }

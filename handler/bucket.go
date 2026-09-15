@@ -31,29 +31,28 @@ func (h *Handler) ListBuckets(w http.ResponseWriter, r *http.Request) {
 
 	result := s3xml.ListAllMyBucketsResult{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
-		Owner: s3xml.Owner{
-			ID:          "cloodsys3",
-			DisplayName: "cloodsys3",
-		},
+		Owner: defaultOwner,
 	}
-
 	for _, b := range buckets {
 		result.Buckets.Bucket = append(result.Buckets.Bucket, s3xml.BucketInfo{
 			Name:         b.Name,
-			CreationDate: b.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+			CreationDate: b.CreatedAt.UTC().Format(lastModifiedFormat),
 		})
 	}
-
 	h.writeXML(w, http.StatusOK, result)
 }
 
-// CreateBucket handles PUT /<bucket>
+// CreateBucket handles PUT /<bucket>.
+//
+// Credentials are bound to exactly one bucket, which is created by an
+// operator (CLI or Admin API). A PUT for the credential's own bucket is
+// therefore idempotent (BucketAlreadyOwnedByYou), and any other name is
+// denied instead of creating an orphan bucket nobody can access.
 func (h *Handler) CreateBucket(w http.ResponseWriter, r *http.Request) {
 	cred, ok := h.authenticateRequest(w, r)
 	if !ok {
 		return
 	}
-
 	if !h.checkWriteAccess(w, r, cred) {
 		return
 	}
@@ -64,7 +63,6 @@ func (h *Handler) CreateBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if bucket already exists
 	existing, err := h.DB.GetBucket(bucketName)
 	if err != nil {
 		h.Logger.Error("db error", "error", err)
@@ -73,33 +71,14 @@ func (h *Handler) CreateBucket(w http.ResponseWriter, r *http.Request) {
 	}
 	if existing != nil {
 		if cred.BucketID == existing.ID {
+			w.Header().Set("Location", "/"+bucketName)
 			s3err.WriteError(w, r, s3err.ErrBucketAlreadyOwnedByYou)
 		} else {
 			s3err.WriteError(w, r, s3err.ErrBucketAlreadyExists)
 		}
 		return
 	}
-
-	// Create bucket in DB
-	bucket, err := h.DB.CreateBucket(bucketName, "")
-	if err != nil {
-		h.Logger.Error("failed to create bucket", "error", err)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
-
-	// Create storage directory
-	if err := h.Storage.CreateBucketDir(bucketName); err != nil {
-		h.Logger.Error("failed to create bucket dir", "error", err)
-		// Rollback DB
-		h.DB.DeleteBucket(bucketName)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
-
-	_ = bucket
-	w.Header().Set("Location", "/"+bucketName)
-	w.WriteHeader(http.StatusOK)
+	s3err.WriteErrorMsg(w, r, s3err.ErrAccessDenied, "Buckets are created by an administrator (cloodsys3 bucket create).")
 }
 
 // DeleteBucket handles DELETE /<bucket>
@@ -108,7 +87,6 @@ func (h *Handler) DeleteBucket(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-
 	if !h.checkWriteAccess(w, r, cred) {
 		return
 	}
@@ -119,30 +97,26 @@ func (h *Handler) DeleteBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check if bucket is empty
-	hasObjects, err := h.DB.BucketHasObjects(bucket.ID)
+	// Any row — including noncurrent versions and delete markers — blocks deletion, as on S3.
+	hasRows, err := h.DB.BucketHasAnyRows(bucket.ID)
 	if err != nil {
 		h.Logger.Error("db error", "error", err)
 		s3err.WriteError(w, r, s3err.ErrInternalError)
 		return
 	}
-	if hasObjects {
+	if hasRows {
 		s3err.WriteError(w, r, s3err.ErrBucketNotEmpty)
 		return
 	}
 
-	// Delete from DB (cascades to credentials and objects)
 	if err := h.DB.DeleteBucket(bucketName); err != nil {
 		h.Logger.Error("failed to delete bucket", "error", err)
 		s3err.WriteError(w, r, s3err.ErrInternalError)
 		return
 	}
-
-	// Delete storage directory
 	if err := h.Storage.DeleteBucketDir(bucketName); err != nil {
 		h.Logger.Error("failed to delete bucket directory", "bucket", bucketName, "error", err)
 	}
-
 	w.WriteHeader(http.StatusNoContent)
 }
 
@@ -152,13 +126,10 @@ func (h *Handler) HeadBucket(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-
 	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
+	if _, ok = h.checkBucketAccess(w, r, cred, bucketName); !ok {
 		return
 	}
-
 	w.Header().Set("x-amz-bucket-region", h.Config.Server.Region)
 	w.WriteHeader(http.StatusOK)
 }

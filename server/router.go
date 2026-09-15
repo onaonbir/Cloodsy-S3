@@ -2,22 +2,27 @@ package server
 
 import (
 	"log/slog"
+	"net"
 	"net/http"
-	"path"
 	"strings"
 
 	"github.com/google/uuid"
 	"github.com/onaonbir/Cloodsy-S3/handler"
+	"github.com/onaonbir/Cloodsy-S3/httpx"
+	"github.com/onaonbir/Cloodsy-S3/s3err"
 )
 
 // maskPresignedQuery replaces sensitive presigned URL params with "***".
 func maskPresignedQuery(raw string) string {
 	parts := strings.Split(raw, "&")
 	for i, p := range parts {
-		if strings.HasPrefix(p, "X-Amz-Signature=") {
+		switch {
+		case strings.HasPrefix(p, "X-Amz-Signature="):
 			parts[i] = "X-Amz-Signature=***"
-		} else if strings.HasPrefix(p, "X-Amz-Credential=") {
+		case strings.HasPrefix(p, "X-Amz-Credential="):
 			parts[i] = "X-Amz-Credential=***"
+		case strings.HasPrefix(p, "X-Amz-Security-Token="):
+			parts[i] = "X-Amz-Security-Token=***"
 		}
 	}
 	return strings.Join(parts, "&")
@@ -33,13 +38,30 @@ type s3Router struct {
 	logger  *slog.Logger
 }
 
+// Sub-resources we understand. Anything else on a bucket or object is
+// answered with NotImplemented rather than being misrouted to the bare
+// bucket/object operation (which previously let `?cors` delete a bucket or
+// `?retention` overwrite an object).
+var (
+	bucketSubresources = map[string]bool{
+		"versioning": true, "lifecycle": true, "notification": true, "acl": true, "tagging": true,
+		"encryption": true, "policy": true, "cors": true, "location": true, "uploads": true,
+		"versions": true, "delete": true, "list-type": true,
+	}
+	unsupportedBucketSubresources = []string{
+		"website", "logging", "replication", "requestPayment", "accelerate", "analytics",
+		"inventory", "metrics", "intelligent-tiering", "object-lock", "ownershipControls",
+		"publicAccessBlock", "policyStatus", "attributes",
+	}
+	unsupportedObjectSubresources = []string{"legal-hold", "retention", "restore", "select", "torrent"}
+)
+
 func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	// Add request ID and security headers
 	requestID := uuid.New().String()
 	w.Header().Set("x-amz-request-id", requestID)
+	w.Header().Set("x-amz-id-2", requestID)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
-	w.Header().Set("X-Frame-Options", "DENY")
-	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Server", "Cloodsy-S3")
 
 	// HSTS header (when TLS is enabled)
 	if sr.handler.Config.Server.TLS.Enabled {
@@ -50,16 +72,21 @@ func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	if origin := r.Header.Get("Origin"); origin != "" {
 		allowed := false
 		for _, o := range sr.handler.Config.Server.CORSOrigins {
-			if o == "*" || o == origin {
+			if o == "*" || strings.EqualFold(o, origin) {
 				allowed = true
 				break
 			}
 		}
 		if allowed {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
+			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, HEAD, OPTIONS")
-			w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Content-MD5, X-Amz-Content-Sha256, X-Amz-Date, X-Amz-Security-Token, X-Amz-User-Agent, X-Amz-Copy-Source, X-Amz-Copy-Source-Range, X-Amz-Meta-*")
-			w.Header().Set("Access-Control-Expose-Headers", "ETag, x-amz-request-id, x-amz-version-id, x-amz-delete-marker")
+			reqHeaders := r.Header.Get("Access-Control-Request-Headers")
+			if reqHeaders == "" {
+				reqHeaders = "Authorization, Content-Type, Content-MD5, Content-Disposition, Cache-Control, Range, If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since, X-Amz-Content-Sha256, X-Amz-Date, X-Amz-Security-Token, X-Amz-User-Agent, X-Amz-Copy-Source, X-Amz-Copy-Source-Range, X-Amz-Acl, X-Amz-Meta-Filename"
+			}
+			w.Header().Set("Access-Control-Allow-Headers", reqHeaders)
+			w.Header().Set("Access-Control-Expose-Headers", "ETag, Content-Length, Content-Range, Accept-Ranges, Last-Modified, x-amz-request-id, x-amz-version-id, x-amz-delete-marker, x-amz-expiration, x-amz-meta-*")
 			w.Header().Set("Access-Control-Max-Age", "86400")
 		}
 	}
@@ -70,35 +97,18 @@ func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// Mask sensitive query params (presigned URL signatures) in logs
 	logQuery := r.URL.RawQuery
-	if strings.Contains(logQuery, "X-Amz-Signature") {
+	if strings.Contains(logQuery, "X-Amz-") {
 		logQuery = maskPresignedQuery(logQuery)
 	}
-
-	sr.logger.Info(r.Method+" "+r.URL.Path,
+	sr.logger.Info(r.Method+" "+httpx.SanitizeLog(r.URL.Path),
 		"remote", r.RemoteAddr,
-		"query", logQuery,
+		"query", httpx.SanitizeLog(logQuery),
+		"requestId", requestID,
 	)
 
-	// Normalize path to prevent double-slash and traversal confusion
-	cleanPath := path.Clean(r.URL.Path)
-	if cleanPath == "." {
-		cleanPath = "/"
-	}
+	bucketName, key := sr.resolve(r)
+	handler.SetBucketAndKey(r, bucketName, key)
 	query := r.URL.Query()
-
-	// Parse bucket and key from path
-	trimmed := strings.TrimPrefix(cleanPath, "/")
-	bucketName := ""
-	key := ""
-	if trimmed != "" {
-		idx := strings.IndexByte(trimmed, '/')
-		if idx < 0 {
-			bucketName = trimmed
-		} else {
-			bucketName = trimmed[:idx]
-			key = trimmed[idx+1:]
-		}
-	}
 
 	// Route: GET / → ListBuckets
 	if bucketName == "" {
@@ -106,128 +116,199 @@ func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			sr.handler.ListBuckets(w, r)
 			return
 		}
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 		return
 	}
 
 	// Route: operations on bucket with key
 	if key != "" {
+		for _, sub := range unsupportedObjectSubresources {
+			if query.Has(sub) {
+				s3err.WriteError(w, r, s3err.ErrNotImplemented)
+				return
+			}
+		}
 		switch r.Method {
 		case http.MethodPut:
-			if query.Has("partNumber") && query.Has("uploadId") {
-				// UploadPartCopy if X-Amz-Copy-Source is present
+			switch {
+			case query.Has("partNumber") && query.Has("uploadId"):
 				if r.Header.Get("X-Amz-Copy-Source") != "" {
 					sr.handler.UploadPartCopy(w, r)
 				} else {
 					sr.handler.UploadPart(w, r)
 				}
-			} else if query.Has("acl") {
+			case query.Has("uploadId") || query.Has("partNumber"):
+				s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+			case query.Has("acl"):
 				sr.handler.PutObjectAcl(w, r)
-			} else if query.Has("tagging") {
+			case query.Has("tagging"):
 				sr.handler.PutObjectTagging(w, r)
-			} else {
+			default:
 				sr.handler.PutObject(w, r)
 			}
 		case http.MethodGet:
-			if query.Has("acl") {
+			switch {
+			case query.Has("acl"):
 				sr.handler.GetObjectAcl(w, r)
-			} else if query.Has("tagging") {
+			case query.Has("tagging"):
 				sr.handler.GetObjectTagging(w, r)
-			} else if query.Has("uploadId") && !query.Has("partNumber") {
-				// GET /<bucket>/<key>?uploadId=X → ListParts
+			case query.Has("uploadId"):
 				sr.handler.ListParts(w, r)
-			} else {
+			default:
 				sr.handler.GetObject(w, r)
 			}
 		case http.MethodHead:
 			sr.handler.HeadObject(w, r)
 		case http.MethodDelete:
-			if query.Has("uploadId") {
+			switch {
+			case query.Has("uploadId"):
 				sr.handler.AbortMultipartUpload(w, r)
-			} else if query.Has("tagging") {
+			case query.Has("tagging"):
 				sr.handler.DeleteObjectTagging(w, r)
-			} else {
+			default:
 				sr.handler.DeleteObject(w, r)
 			}
 		case http.MethodPost:
-			if query.Has("uploadId") {
+			switch {
+			case query.Has("uploadId"):
 				sr.handler.CompleteMultipartUpload(w, r)
-			} else if query.Has("uploads") {
+			case query.Has("uploads"):
 				sr.handler.CreateMultipartUpload(w, r)
-			} else {
-				w.WriteHeader(http.StatusMethodNotAllowed)
+			default:
+				s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 			}
 		default:
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 		}
 		return
 	}
 
 	// Route: operations on bucket (no key)
+	for _, sub := range unsupportedBucketSubresources {
+		if query.Has(sub) {
+			s3err.WriteError(w, r, s3err.ErrNotImplemented)
+			return
+		}
+	}
 	switch r.Method {
 	case http.MethodPut:
-		if query.Has("versioning") {
+		switch {
+		case query.Has("versioning"):
 			sr.handler.PutBucketVersioning(w, r)
-		} else if query.Has("lifecycle") {
+		case query.Has("lifecycle"):
 			sr.handler.PutBucketLifecycle(w, r)
-		} else if query.Has("notification") {
+		case query.Has("notification"):
 			sr.handler.PutBucketNotification(w, r)
-		} else if query.Has("acl") {
+		case query.Has("acl"):
 			sr.handler.PutBucketAcl(w, r)
-		} else if query.Has("tagging") {
+		case query.Has("tagging"):
 			sr.handler.PutBucketTagging(w, r)
-		} else if query.Has("encryption") {
+		case query.Has("encryption"):
 			sr.handler.PutBucketEncryption(w, r)
-		} else if query.Has("policy") {
+		case query.Has("policy"):
 			sr.handler.PutBucketPolicy(w, r)
-		} else {
+		case query.Has("cors"):
+			sr.handler.PutBucketCors(w, r)
+		case hasAnySubresource(query):
+			s3err.WriteError(w, r, s3err.ErrNotImplemented)
+		default:
 			sr.handler.CreateBucket(w, r)
 		}
 	case http.MethodDelete:
-		if query.Has("lifecycle") {
+		switch {
+		case query.Has("lifecycle"):
 			sr.handler.DeleteBucketLifecycle(w, r)
-		} else if query.Has("notification") {
+		case query.Has("notification"):
 			sr.handler.DeleteBucketNotification(w, r)
-		} else if query.Has("tagging") {
+		case query.Has("tagging"):
 			sr.handler.DeleteBucketTagging(w, r)
-		} else if query.Has("policy") {
+		case query.Has("policy"):
 			sr.handler.DeleteBucketPolicy(w, r)
-		} else {
+		case query.Has("encryption"):
+			sr.handler.DeleteBucketEncryption(w, r)
+		case query.Has("cors"):
+			sr.handler.DeleteBucketCors(w, r)
+		case hasAnySubresource(query):
+			s3err.WriteError(w, r, s3err.ErrNotImplemented)
+		default:
 			sr.handler.DeleteBucket(w, r)
 		}
 	case http.MethodHead:
 		sr.handler.HeadBucket(w, r)
 	case http.MethodGet:
-		if query.Has("location") {
+		switch {
+		case query.Has("location"):
 			sr.handler.GetBucketLocation(w, r)
-		} else if query.Has("uploads") {
+		case query.Has("uploads"):
 			sr.handler.ListMultipartUploads(w, r)
-		} else if query.Has("acl") {
+		case query.Has("acl"):
 			sr.handler.GetBucketAcl(w, r)
-		} else if query.Has("tagging") {
+		case query.Has("tagging"):
 			sr.handler.GetBucketTagging(w, r)
-		} else if query.Has("encryption") {
+		case query.Has("encryption"):
 			sr.handler.GetBucketEncryption(w, r)
-		} else if query.Has("policy") {
+		case query.Has("policy"):
 			sr.handler.GetBucketPolicy(w, r)
-		} else if query.Has("versioning") {
+		case query.Has("cors"):
+			sr.handler.GetBucketCors(w, r)
+		case query.Has("versioning"):
 			sr.handler.GetBucketVersioning(w, r)
-		} else if query.Has("versions") {
+		case query.Has("versions"):
 			sr.handler.ListObjectVersions(w, r)
-		} else if query.Has("lifecycle") {
+		case query.Has("lifecycle"):
 			sr.handler.GetBucketLifecycle(w, r)
-		} else if query.Has("notification") {
+		case query.Has("notification"):
 			sr.handler.GetBucketNotification(w, r)
-		} else {
+		default:
 			sr.handler.ListObjects(w, r)
 		}
 	case http.MethodPost:
 		if query.Has("delete") {
 			sr.handler.DeleteMultipleObjects(w, r)
 		} else {
-			w.WriteHeader(http.StatusMethodNotAllowed)
+			s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 		}
 	default:
-		w.WriteHeader(http.StatusMethodNotAllowed)
+		s3err.WriteError(w, r, s3err.ErrMethodNotAllowed)
 	}
+}
+
+// hasAnySubresource reports whether the query names a bucket sub-resource
+// (as opposed to listing parameters such as prefix/max-keys).
+func hasAnySubresource(query map[string][]string) bool {
+	for k := range query {
+		if bucketSubresources[k] {
+			return true
+		}
+	}
+	return false
+}
+
+// resolve extracts bucket and key from the request. Path-style is the
+// default; when server.virtual_host_domains is configured, a Host header of
+// "<bucket>.<domain>" selects the bucket and the whole path is the key.
+func (sr *s3Router) resolve(r *http.Request) (bucket, key string) {
+	path := strings.TrimPrefix(r.URL.Path, "/")
+
+	host := r.Host
+	if h, _, err := net.SplitHostPort(host); err == nil {
+		host = h
+	}
+	host = strings.ToLower(host)
+	for _, domain := range sr.handler.Config.Server.VirtualHostDomains {
+		domain = strings.ToLower(strings.TrimPrefix(domain, "."))
+		if domain == "" || !strings.HasSuffix(host, "."+domain) {
+			continue
+		}
+		b := strings.TrimSuffix(host, "."+domain)
+		if b != "" && !strings.Contains(b, ".") {
+			return b, path
+		}
+	}
+
+	idx := strings.IndexByte(path, '/')
+	if idx < 0 {
+		return path, ""
+	}
+	return path[:idx], path[idx+1:]
 }

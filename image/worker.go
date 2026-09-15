@@ -2,8 +2,10 @@ package image
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
+	"runtime/debug"
 	"sync"
 
 	"github.com/onaonbir/Cloodsy-S3/storage"
@@ -29,9 +31,11 @@ type Job struct {
 
 // WorkerConfig configures the optimizer pool.
 type WorkerConfig struct {
-	Quality   int
-	Workers   int
-	QueueSize int
+	Quality        int
+	Workers        int
+	QueueSize      int
+	MaxSourceBytes int64    // objects larger than this are skipped (0 = 32 MB)
+	Limiter        *Limiter // optional shared decode limiter
 }
 
 // Worker generates optimized image variants in the background. The optimized
@@ -44,7 +48,8 @@ type Worker struct {
 	logger *slog.Logger
 	jobs   chan Job
 	wg     sync.WaitGroup
-	once   sync.Once
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewWorker builds a Worker. Call Start to launch the pool.
@@ -58,6 +63,9 @@ func NewWorker(store VariantStore, cfg WorkerConfig, logger *slog.Logger) *Worke
 	if cfg.QueueSize <= 0 {
 		cfg.QueueSize = 256
 	}
+	if cfg.MaxSourceBytes <= 0 {
+		cfg.MaxSourceBytes = 32 << 20
+	}
 	return &Worker{
 		store:  store,
 		cfg:    cfg,
@@ -67,7 +75,7 @@ func NewWorker(store VariantStore, cfg WorkerConfig, logger *slog.Logger) *Worke
 }
 
 // Start launches the worker goroutines. They drain the queue until Stop is
-// called or ctx is cancelled.
+// called or ctx is cancelled. A panic in a decoder is contained per job.
 func (w *Worker) Start(ctx context.Context) {
 	for i := 0; i < w.cfg.Workers; i++ {
 		w.wg.Add(1)
@@ -89,8 +97,14 @@ func (w *Worker) Start(ctx context.Context) {
 }
 
 // Enqueue submits a job for asynchronous optimization. It never blocks: if the
-// queue is full the job is dropped (and logged) rather than stalling the PUT.
+// queue is full (or the worker is stopped) the job is dropped rather than
+// stalling the PUT.
 func (w *Worker) Enqueue(job Job) bool {
+	w.mu.RLock()
+	defer w.mu.RUnlock()
+	if w.closed {
+		return false
+	}
 	select {
 	case w.jobs <- job:
 		return true
@@ -100,10 +114,19 @@ func (w *Worker) Enqueue(job Job) bool {
 	}
 }
 
-// Process optimizes a single object synchronously. Best-effort: any error is
-// logged and the original is left untouched.
+// Process optimizes a single object synchronously. Best-effort: any error or
+// panic is logged and the original is left untouched.
 func (w *Worker) Process(job Job) {
-	if err := OptimizeOne(w.store, job, w.cfg.Quality); err != nil {
+	defer func() {
+		if rec := recover(); rec != nil {
+			w.logger.Error("image optimizer panic", "key", job.Key, "panic", fmt.Sprint(rec), "stack", string(debug.Stack()))
+		}
+	}()
+	if w.cfg.Limiter != nil {
+		w.cfg.Limiter.Acquire(context.Background())
+		defer w.cfg.Limiter.Release()
+	}
+	if err := OptimizeOne(w.store, job, w.cfg.Quality, w.cfg.MaxSourceBytes); err != nil {
 		w.logger.Debug("optimize failed", "key", job.Key, "error", err)
 	}
 }
@@ -112,9 +135,12 @@ func (w *Worker) Process(job Job) {
 // single object and writes it to the variant cache. The original is never
 // touched. Returns nil for non-image content types (nothing to do). Shared by
 // the background Worker and the CLI/admin reprocess paths.
-func OptimizeOne(store VariantStore, job Job, quality int) error {
+func OptimizeOne(store VariantStore, job Job, quality int, maxSourceBytes int64) error {
 	if !IsImageContentType(job.ContentType) {
 		return nil
+	}
+	if maxSourceBytes <= 0 {
+		maxSourceBytes = 32 << 20
 	}
 	p := Params{Mode: ModeFit, Quality: quality}
 	cacheKey := storage.VariantCacheKey(job.Key, job.VersionID, job.ETag, p.Spec())
@@ -129,9 +155,9 @@ func OptimizeOne(store VariantStore, job Job, quality int) error {
 	if err != nil {
 		return err
 	}
+	defer src.Close()
 
-	data, _, terr := Transform(src, job.ContentType, p)
-	src.Close()
+	data, _, terr := Transform(io.LimitReader(src, maxSourceBytes+1), job.ContentType, p)
 	if terr != nil {
 		return terr
 	}
@@ -141,6 +167,11 @@ func OptimizeOne(store VariantStore, job Job, quality int) error {
 // Stop closes the queue and waits for in-flight jobs to finish. Safe to call
 // more than once.
 func (w *Worker) Stop() {
-	w.once.Do(func() { close(w.jobs) })
+	w.mu.Lock()
+	if !w.closed {
+		w.closed = true
+		close(w.jobs)
+	}
+	w.mu.Unlock()
 	w.wg.Wait()
 }

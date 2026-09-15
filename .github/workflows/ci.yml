@@ -1,0 +1,71 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  CGO_ENABLED: 0
+
+jobs:
+  test:
+    name: Build, vet, test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          check-latest: true
+
+      - name: gofmt
+        run: |
+          out="$(gofmt -l .)"
+          if [ -n "$out" ]; then
+            echo "::error::Files are not gofmt-formatted:"
+            echo "$out"
+            exit 1
+          fi
+
+      - name: go mod tidy check
+        run: |
+          go mod tidy
+          git diff --exit-code -- go.mod go.sum || { echo "::error::go.mod/go.sum are not tidy"; exit 1; }
+
+      - name: Build
+        run: go build -trimpath ./...
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Cross-compile release targets
+        run: |
+          set -e
+          for t in linux/amd64 linux/arm64 linux/arm windows/amd64 darwin/arm64 darwin/amd64; do
+            echo "== $t"
+            GOOS="${t%/*}" GOARCH="${t#*/}" GOARM=7 go build -trimpath -o /dev/null .
+          done
+
+  vuln:
+    name: govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Vulnerability check
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          go-package: ./...

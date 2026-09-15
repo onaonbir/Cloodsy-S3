@@ -7,6 +7,7 @@ package image
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"image"
 	"image/jpeg"
@@ -42,7 +43,12 @@ const (
 	MaxDimension    = 5000             // clamp for w/h
 	MaxDecodePixels = 50 * 1000 * 1000 // ~50 MP source guard (checked before decode)
 	DefaultQuality  = 75
+	// DefaultMaxSourceBytes bounds how much of a source object is read.
+	DefaultMaxSourceBytes = 32 << 20
 )
+
+// ErrSourceTooLarge is returned when the source exceeds the byte or pixel limits.
+var ErrSourceTooLarge = errors.New("source image too large")
 
 // Params is a parsed, validated transform request.
 type Params struct {
@@ -84,8 +90,6 @@ func ParseParams(q url.Values) (Params, bool) {
 		p.Quality = clamp(v, 1, 100)
 	}
 
-	// Only a meaningful transform if we have at least one dimension OR an
-	// explicit quality (re-encode). Width/height==0 with no q means no-op.
 	if p.Width == 0 && p.Height == 0 && !hasQ {
 		return p, false
 	}
@@ -108,32 +112,60 @@ func IsImageContentType(ct string) bool {
 	return false
 }
 
+// sniffFormat identifies the container from magic bytes; the declared
+// content-type is not trusted for decoder selection.
+func sniffFormat(b []byte) string {
+	switch {
+	case len(b) >= 3 && b[0] == 0xFF && b[1] == 0xD8 && b[2] == 0xFF:
+		return "jpeg"
+	case len(b) >= 8 && string(b[:8]) == "\x89PNG\r\n\x1a\n":
+		return "png"
+	case len(b) >= 6 && (string(b[:6]) == "GIF87a" || string(b[:6]) == "GIF89a"):
+		return "gif"
+	case len(b) >= 12 && string(b[:4]) == "RIFF" && string(b[8:12]) == "WEBP":
+		return "webp"
+	}
+	return ""
+}
+
 // Transform decodes src, applies the resize/encode described by p, and returns
-// the encoded bytes plus the resulting content-type. srcContentType selects the
-// output encoder. Because there is no pure-Go WebP encoder, WebP (and GIF)
-// inputs are transcoded to JPEG (or PNG when alpha must be preserved).
+// the encoded bytes plus the resulting content-type. The source is read at
+// most up to DefaultMaxSourceBytes (callers may pass a tighter LimitReader);
+// dimensions are checked before the full decode; JPEG EXIF orientation is
+// applied so rotated phone photos come out upright. Because there is no
+// pure-Go WebP encoder, WebP (and GIF) inputs are transcoded to PNG.
 func Transform(src io.Reader, srcContentType string, p Params) ([]byte, string, error) {
-	// Read fully so we can inspect config before committing to a full decode.
-	raw, err := io.ReadAll(src)
+	raw, err := io.ReadAll(io.LimitReader(src, DefaultMaxSourceBytes+1))
 	if err != nil {
 		return nil, "", fmt.Errorf("read source: %w", err)
+	}
+	if len(raw) > DefaultMaxSourceBytes {
+		return nil, "", ErrSourceTooLarge
+	}
+	format := sniffFormat(raw)
+	if format == "" {
+		return nil, "", fmt.Errorf("unsupported image format")
 	}
 
 	cfg, _, err := image.DecodeConfig(bytes.NewReader(raw))
 	if err != nil {
 		return nil, "", fmt.Errorf("decode config: %w", err)
 	}
-	if int64(cfg.Width)*int64(cfg.Height) > MaxDecodePixels {
-		return nil, "", fmt.Errorf("source image too large: %dx%d", cfg.Width, cfg.Height)
+	if cfg.Width <= 0 || cfg.Height <= 0 || int64(cfg.Width)*int64(cfg.Height) > MaxDecodePixels {
+		return nil, "", fmt.Errorf("%w: %dx%d", ErrSourceTooLarge, cfg.Width, cfg.Height)
 	}
 
-	img, format, err := image.Decode(bytes.NewReader(raw))
+	var img image.Image
+	if format == "jpeg" {
+		img, err = imaging.Decode(bytes.NewReader(raw), imaging.AutoOrientation(true))
+	} else {
+		img, _, err = image.Decode(bytes.NewReader(raw))
+	}
 	if err != nil {
 		return nil, "", fmt.Errorf("decode: %w", err)
 	}
 
 	img = resize(img, p)
-
 	return encode(img, format, p.Quality)
 }
 
@@ -143,11 +175,10 @@ func resize(img image.Image, p Params) image.Image {
 	if p.Width == 0 && p.Height == 0 {
 		return img
 	}
+	b := img.Bounds()
 	switch p.Mode {
 	case ModeFill:
-		// Fill needs both dimensions; fall back to the missing one from source.
 		w, h := p.Width, p.Height
-		b := img.Bounds()
 		if w == 0 {
 			w = b.Dx()
 		}
@@ -156,10 +187,7 @@ func resize(img image.Image, p Params) image.Image {
 		}
 		return imaging.Fill(img, w, h, imaging.Center, imaging.Lanczos)
 	case ModeExact:
-		// Resize with a zero dimension preserves aspect ratio in imaging, which
-		// is not "exact"; supply source size for the unset axis to truly stretch.
 		w, h := p.Width, p.Height
-		b := img.Bounds()
 		if w == 0 {
 			w = b.Dx()
 		}
@@ -167,13 +195,16 @@ func resize(img image.Image, p Params) image.Image {
 			h = b.Dy()
 		}
 		return imaging.Resize(img, w, h, imaging.Lanczos)
-	default: // ModeFit — proportional; imaging.Fit treats 0 as "no bound".
+	default: // ModeFit — proportional; never upscale beyond the source.
 		w, h := p.Width, p.Height
-		if w == 0 {
-			w = MaxDimension
+		if w == 0 || w > b.Dx() {
+			w = b.Dx()
 		}
-		if h == 0 {
-			h = MaxDimension
+		if h == 0 || h > b.Dy() {
+			h = b.Dy()
+		}
+		if w >= b.Dx() && h >= b.Dy() {
+			return img
 		}
 		return imaging.Fit(img, w, h, imaging.Lanczos)
 	}
@@ -199,6 +230,16 @@ func encode(img image.Image, srcFormat string, quality int) ([]byte, string, err
 			return nil, "", fmt.Errorf("encode jpeg: %w", err)
 		}
 		return buf.Bytes(), "image/jpeg", nil
+	}
+}
+
+// VariantContentType mirrors encode's choice for a stored source content-type.
+func VariantContentType(srcCT string) string {
+	switch strings.ToLower(strings.TrimSpace(strings.Split(srcCT, ";")[0])) {
+	case "image/png", "image/gif", "image/webp":
+		return "image/png"
+	default:
+		return "image/jpeg"
 	}
 }
 

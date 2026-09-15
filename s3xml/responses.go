@@ -26,34 +26,36 @@ type BucketInfo struct {
 
 // ListBucketResult is the response for ListObjects (v1)
 type ListBucketResult struct {
-	XMLName        xml.Name  `xml:"ListBucketResult"`
-	Xmlns          string    `xml:"xmlns,attr"`
-	Name           string    `xml:"Name"`
-	Prefix         string    `xml:"Prefix"`
-	Marker         string    `xml:"Marker"`
-	MaxKeys        int       `xml:"MaxKeys"`
-	IsTruncated    bool      `xml:"IsTruncated"`
-	Contents       []Object  `xml:"Contents"`
+	XMLName        xml.Name       `xml:"ListBucketResult"`
+	Xmlns          string         `xml:"xmlns,attr"`
+	Name           string         `xml:"Name"`
+	Prefix         string         `xml:"Prefix"`
+	Marker         string         `xml:"Marker"`
+	NextMarker     string         `xml:"NextMarker,omitempty"`
+	MaxKeys        int            `xml:"MaxKeys"`
+	Delimiter      string         `xml:"Delimiter,omitempty"`
+	EncodingType   string         `xml:"EncodingType,omitempty"`
+	IsTruncated    bool           `xml:"IsTruncated"`
+	Contents       []Object       `xml:"Contents"`
 	CommonPrefixes []CommonPrefix `xml:"CommonPrefixes,omitempty"`
-	Delimiter      string    `xml:"Delimiter,omitempty"`
-	NextMarker     string    `xml:"NextMarker,omitempty"`
 }
 
 // ListBucketResultV2 is the response for ListObjectsV2
 type ListBucketResultV2 struct {
-	XMLName               xml.Name  `xml:"ListBucketResult"`
-	Xmlns                 string    `xml:"xmlns,attr"`
-	Name                  string    `xml:"Name"`
-	Prefix                string    `xml:"Prefix"`
-	MaxKeys               int       `xml:"MaxKeys"`
-	IsTruncated           bool      `xml:"IsTruncated"`
-	Contents              []Object  `xml:"Contents"`
+	XMLName               xml.Name       `xml:"ListBucketResult"`
+	Xmlns                 string         `xml:"xmlns,attr"`
+	Name                  string         `xml:"Name"`
+	Prefix                string         `xml:"Prefix"`
+	StartAfter            string         `xml:"StartAfter,omitempty"`
+	ContinuationToken     string         `xml:"ContinuationToken,omitempty"`
+	NextContinuationToken string         `xml:"NextContinuationToken,omitempty"`
+	KeyCount              int            `xml:"KeyCount"`
+	MaxKeys               int            `xml:"MaxKeys"`
+	Delimiter             string         `xml:"Delimiter,omitempty"`
+	EncodingType          string         `xml:"EncodingType,omitempty"`
+	IsTruncated           bool           `xml:"IsTruncated"`
+	Contents              []Object       `xml:"Contents"`
 	CommonPrefixes        []CommonPrefix `xml:"CommonPrefixes,omitempty"`
-	Delimiter             string    `xml:"Delimiter,omitempty"`
-	KeyCount              int       `xml:"KeyCount"`
-	ContinuationToken     string    `xml:"ContinuationToken,omitempty"`
-	NextContinuationToken string    `xml:"NextContinuationToken,omitempty"`
-	StartAfter            string    `xml:"StartAfter,omitempty"`
 }
 
 type Object struct {
@@ -71,6 +73,15 @@ type CommonPrefix struct {
 // CopyObjectResult
 type CopyObjectResult struct {
 	XMLName      xml.Name `xml:"CopyObjectResult"`
+	Xmlns        string   `xml:"xmlns,attr"`
+	LastModified string   `xml:"LastModified"`
+	ETag         string   `xml:"ETag"`
+}
+
+// CopyPartResult
+type CopyPartResult struct {
+	XMLName      xml.Name `xml:"CopyPartResult"`
+	Xmlns        string   `xml:"xmlns,attr"`
 	LastModified string   `xml:"LastModified"`
 	ETag         string   `xml:"ETag"`
 }
@@ -118,20 +129,24 @@ type DeleteObject struct {
 }
 
 type DeleteResult struct {
-	XMLName xml.Name       `xml:"DeleteResult"`
-	Xmlns   string         `xml:"xmlns,attr"`
+	XMLName xml.Name        `xml:"DeleteResult"`
+	Xmlns   string          `xml:"xmlns,attr"`
 	Deleted []DeletedObject `xml:"Deleted,omitempty"`
-	Errors  []DeleteError  `xml:"Error,omitempty"`
+	Errors  []DeleteError   `xml:"Error,omitempty"`
 }
 
 type DeletedObject struct {
-	Key string `xml:"Key"`
+	Key                   string `xml:"Key"`
+	VersionId             string `xml:"VersionId,omitempty"`
+	DeleteMarker          bool   `xml:"DeleteMarker,omitempty"`
+	DeleteMarkerVersionId string `xml:"DeleteMarkerVersionId,omitempty"`
 }
 
 type DeleteError struct {
-	Key     string `xml:"Key"`
-	Code    string `xml:"Code"`
-	Message string `xml:"Message"`
+	Key       string `xml:"Key"`
+	VersionId string `xml:"VersionId,omitempty"`
+	Code      string `xml:"Code"`
+	Message   string `xml:"Message"`
 }
 
 // LocationConstraint for CreateBucket response
@@ -143,17 +158,21 @@ type LocationConstraint struct {
 
 // ListVersionsResult is the response for ListObjectVersions
 type ListVersionsResult struct {
-	XMLName              xml.Name            `xml:"ListVersionsResult"`
-	Xmlns                string              `xml:"xmlns,attr"`
-	Name                 string              `xml:"Name"`
-	Prefix               string              `xml:"Prefix"`
-	KeyMarker            string              `xml:"KeyMarker"`
-	NextKeyMarker        string              `xml:"NextKeyMarker,omitempty"`
-	NextVersionIdMarker  string              `xml:"NextVersionIdMarker,omitempty"`
-	MaxKeys              int                 `xml:"MaxKeys"`
-	IsTruncated          bool                `xml:"IsTruncated"`
-	Versions             []VersionEntry      `xml:"Version,omitempty"`
-	DeleteMarkers        []DeleteMarkerEntry `xml:"DeleteMarker,omitempty"`
+	XMLName             xml.Name            `xml:"ListVersionsResult"`
+	Xmlns               string              `xml:"xmlns,attr"`
+	Name                string              `xml:"Name"`
+	Prefix              string              `xml:"Prefix"`
+	KeyMarker           string              `xml:"KeyMarker"`
+	VersionIdMarker     string              `xml:"VersionIdMarker"`
+	NextKeyMarker       string              `xml:"NextKeyMarker,omitempty"`
+	NextVersionIdMarker string              `xml:"NextVersionIdMarker,omitempty"`
+	MaxKeys             int                 `xml:"MaxKeys"`
+	Delimiter           string              `xml:"Delimiter,omitempty"`
+	EncodingType        string              `xml:"EncodingType,omitempty"`
+	IsTruncated         bool                `xml:"IsTruncated"`
+	Versions            []VersionEntry      `xml:"Version,omitempty"`
+	DeleteMarkers       []DeleteMarkerEntry `xml:"DeleteMarker,omitempty"`
+	CommonPrefixes      []CommonPrefix      `xml:"CommonPrefixes,omitempty"`
 }
 
 type VersionEntry struct {
@@ -164,6 +183,7 @@ type VersionEntry struct {
 	ETag         string `xml:"ETag"`
 	Size         int64  `xml:"Size"`
 	StorageClass string `xml:"StorageClass"`
+	Owner        Owner  `xml:"Owner"`
 }
 
 type DeleteMarkerEntry struct {
@@ -171,29 +191,34 @@ type DeleteMarkerEntry struct {
 	VersionId    string `xml:"VersionId"`
 	IsLatest     bool   `xml:"IsLatest"`
 	LastModified string `xml:"LastModified"`
+	Owner        Owner  `xml:"Owner"`
 }
 
 // ListMultipartUploadsResult
 type ListMultipartUploadsResult struct {
-	XMLName            xml.Name       `xml:"ListMultipartUploadsResult"`
-	Xmlns              string         `xml:"xmlns,attr"`
-	Bucket             string         `xml:"Bucket"`
-	KeyMarker          string         `xml:"KeyMarker"`
-	UploadIdMarker     string         `xml:"UploadIdMarker"`
-	NextKeyMarker      string         `xml:"NextKeyMarker,omitempty"`
-	NextUploadIdMarker string         `xml:"NextUploadIdMarker,omitempty"`
-	MaxUploads         int            `xml:"MaxUploads"`
-	IsTruncated        bool           `xml:"IsTruncated"`
+	XMLName            xml.Name               `xml:"ListMultipartUploadsResult"`
+	Xmlns              string                 `xml:"xmlns,attr"`
+	Bucket             string                 `xml:"Bucket"`
+	KeyMarker          string                 `xml:"KeyMarker"`
+	UploadIdMarker     string                 `xml:"UploadIdMarker"`
+	NextKeyMarker      string                 `xml:"NextKeyMarker,omitempty"`
+	NextUploadIdMarker string                 `xml:"NextUploadIdMarker,omitempty"`
+	MaxUploads         int                    `xml:"MaxUploads"`
+	IsTruncated        bool                   `xml:"IsTruncated"`
 	Uploads            []MultipartUploadEntry `xml:"Upload,omitempty"`
-	Prefix             string         `xml:"Prefix"`
-	Delimiter          string         `xml:"Delimiter,omitempty"`
+	Prefix             string                 `xml:"Prefix"`
+	Delimiter          string                 `xml:"Delimiter,omitempty"`
+	CommonPrefixes     []CommonPrefix         `xml:"CommonPrefixes,omitempty"`
+	EncodingType       string                 `xml:"EncodingType,omitempty"`
 }
 
 type MultipartUploadEntry struct {
 	Key          string `xml:"Key"`
 	UploadId     string `xml:"UploadId"`
-	Initiated    string `xml:"Initiated"`
+	Initiator    Owner  `xml:"Initiator"`
+	Owner        Owner  `xml:"Owner"`
 	StorageClass string `xml:"StorageClass"`
+	Initiated    string `xml:"Initiated"`
 }
 
 // ListPartsResult
@@ -203,6 +228,11 @@ type ListPartsResult struct {
 	Bucket               string      `xml:"Bucket"`
 	Key                  string      `xml:"Key"`
 	UploadId             string      `xml:"UploadId"`
+	Initiator            Owner       `xml:"Initiator"`
+	Owner                Owner       `xml:"Owner"`
+	StorageClass         string      `xml:"StorageClass"`
+	PartNumberMarker     int         `xml:"PartNumberMarker"`
+	NextPartNumberMarker int         `xml:"NextPartNumberMarker,omitempty"`
 	MaxParts             int         `xml:"MaxParts"`
 	IsTruncated          bool        `xml:"IsTruncated"`
 	Parts                []PartEntry `xml:"Part,omitempty"`
@@ -235,8 +265,8 @@ type ACL struct {
 }
 
 type Grant struct {
-	Grantee Grantee `xml:"Grantee"`
-	Permission string `xml:"Permission"`
+	Grantee    Grantee `xml:"Grantee"`
+	Permission string  `xml:"Permission"`
 }
 
 type Grantee struct {
@@ -246,7 +276,8 @@ type Grantee struct {
 	DisplayName string `xml:"DisplayName,omitempty"`
 }
 
-// LifecycleConfiguration for bucket lifecycle management
+// LifecycleConfiguration for bucket lifecycle management. Both the legacy
+// top-level <Prefix> and the current <Filter> forms are accepted.
 type LifecycleConfiguration struct {
 	XMLName xml.Name        `xml:"LifecycleConfiguration"`
 	Xmlns   string          `xml:"xmlns,attr,omitempty"`
@@ -254,14 +285,59 @@ type LifecycleConfiguration struct {
 }
 
 type LifecycleRule struct {
-	ID         string              `xml:"ID,omitempty"`
-	Prefix     string              `xml:"Prefix"`
-	Status     string              `xml:"Status"`
-	Expiration LifecycleExpiration `xml:"Expiration"`
+	ID                             string                          `xml:"ID,omitempty"`
+	Prefix                         *string                         `xml:"Prefix,omitempty"`
+	Filter                         *LifecycleFilter                `xml:"Filter,omitempty"`
+	Status                         string                          `xml:"Status"`
+	Expiration                     *LifecycleExpiration            `xml:"Expiration,omitempty"`
+	NoncurrentVersionExpiration    *NoncurrentVersionExpiration    `xml:"NoncurrentVersionExpiration,omitempty"`
+	AbortIncompleteMultipartUpload *AbortIncompleteMultipartUpload `xml:"AbortIncompleteMultipartUpload,omitempty"`
+	Transitions                    []LifecycleTransition           `xml:"Transition,omitempty"`
+}
+
+type LifecycleFilter struct {
+	Prefix *string           `xml:"Prefix,omitempty"`
+	And    *LifecycleAnd     `xml:"And,omitempty"`
+	Tag    *LifecycleTag     `xml:"Tag,omitempty"`
+	Size   *LifecycleSizeAny `xml:",any,omitempty"`
+}
+
+// LifecycleSizeAny swallows ObjectSizeGreaterThan/LessThan so the decoder
+// does not choke on them; they are not enforced.
+type LifecycleSizeAny struct {
+	XMLName xml.Name
+	Value   string `xml:",chardata"`
+}
+
+type LifecycleAnd struct {
+	Prefix *string        `xml:"Prefix,omitempty"`
+	Tags   []LifecycleTag `xml:"Tag,omitempty"`
+}
+
+type LifecycleTag struct {
+	Key   string `xml:"Key"`
+	Value string `xml:"Value"`
 }
 
 type LifecycleExpiration struct {
-	Days int `xml:"Days"`
+	Days                      int    `xml:"Days,omitempty"`
+	Date                      string `xml:"Date,omitempty"`
+	ExpiredObjectDeleteMarker bool   `xml:"ExpiredObjectDeleteMarker,omitempty"`
+}
+
+type NoncurrentVersionExpiration struct {
+	NoncurrentDays          int `xml:"NoncurrentDays,omitempty"`
+	NewerNoncurrentVersions int `xml:"NewerNoncurrentVersions,omitempty"`
+}
+
+type AbortIncompleteMultipartUpload struct {
+	DaysAfterInitiation int `xml:"DaysAfterInitiation"`
+}
+
+type LifecycleTransition struct {
+	Days         int    `xml:"Days,omitempty"`
+	Date         string `xml:"Date,omitempty"`
+	StorageClass string `xml:"StorageClass,omitempty"`
 }
 
 // NotificationConfiguration for bucket webhook notifications
@@ -273,6 +349,7 @@ type NotificationConfiguration struct {
 
 type WebhookConfiguration struct {
 	ID         int64  `xml:"Id,omitempty"`
+	Name       string `xml:"Name,omitempty"`
 	URL        string `xml:"Url"`
 	EventTypes string `xml:"EventTypes,omitempty"`
 	Secret     string `xml:"Secret,omitempty"`

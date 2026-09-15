@@ -1,48 +1,100 @@
 # Cloodsy S3 - Configuration File
-# Copy this file and pass with: cloodsys3 serve -config config.yaml
-# All values below are defaults - only override what you need.
+#
+# Copy this file and pass it with:  cloodsys3 serve -config config.yaml
+# Every value below is the default; only override what you need. Unknown keys
+# are rejected at start-up so typos are caught early.
+#
+# Environment variables override the file (handy for systemd / containers):
+#   CLOODSYS3_CONFIG          path of the config file (same as -config)
+#   CLOODSYS3_LISTEN          server.listen
+#   CLOODSYS3_REGION          server.region
+#   CLOODSYS3_TLS_ENABLED     server.tls.enabled (true/false)
+#   CLOODSYS3_TLS_CERT        server.tls.cert_file
+#   CLOODSYS3_TLS_KEY         server.tls.key_file
+#   CLOODSYS3_DB_PATH         database.path
+#   CLOODSYS3_DATA_DIR        storage.root_dir
+#   CLOODSYS3_LOG_LEVEL       logging.level
+#   CLOODSYS3_LOG_FORMAT      logging.format
+#   CLOODSYS3_ADMIN_ENABLED   admin.enabled (true/false)
+#   CLOODSYS3_ADMIN_LISTEN    admin.listen
+#   CLOODSYS3_WEBDAV_ENABLED  webdav.enabled (true/false)
+#   CLOODSYS3_WEBDAV_LISTEN   webdav.listen
+#   CLOODSYS3_UPDATE_CHECK    update.check_on_start (true/false)
 
 server:
-  listen: ":9000"              # Listen address and port
-  region: "us-east-1"          # S3 region name (used for SigV4 signing)
+  listen: ":9000"                 # S3 API listen address (host:port)
+  region: "us-east-1"             # Region name used for SigV4 scope checks
   tls:
-    enabled: false
-    cert_file: ""              # Path to the TLS certificate file
-    key_file: ""               # Path to the TLS private key file
+    enabled: false                # Serve the S3 API over HTTPS
+    cert_file: ""                 # PEM certificate (required when enabled)
+    key_file: ""                  # PEM private key (required when enabled)
+  cors_origins: []                # Browser origins allowed to call the S3 API, e.g. ["https://app.example.com"].
+                                  # Empty = no CORS headers are sent (browser clients will fail preflight).
+  virtual_host_domains: []        # Enable virtual-hosted-style requests: with ["s3.example.com"] a request
+                                  # to "photos.s3.example.com" is treated as bucket "photos".
+  max_connections: 0              # Cap on simultaneous S3 connections (0 = unlimited)
+  idle_timeout: "60s"             # Abort a request that transfers no bytes for this long. Bounds slow
+                                  # clients without limiting the total time of large uploads/downloads.
+  require_payload_signature: false  # Reject header-authenticated requests that send UNSIGNED-PAYLOAD.
+                                    # Presigned URLs are unaffected. Enable when all clients sign payloads.
 
 database:
-  path: "./.cloodsys3/cloodsys3.db"   # SQLite database file
+  path: "./.cloodsys3/cloodsys3.db"   # SQLite database file (metadata only, objects live on disk)
   busy_timeout: 5000                   # SQLite busy timeout (ms) - write-lock wait time
   cache_size: 64000                    # SQLite page cache size (KB)
   mmap_size: 134217728                 # SQLite memory-mapped I/O size (bytes, 128MB)
   max_readers: 4                       # Number of parallel read connections
 
 storage:
-  root_dir: "./.cloodsys3/data"        # Root directory where object files are stored
-  multipart_max_age: "24h"             # Cleanup age for incomplete multipart uploads
-  lifecycle_interval: "1h"             # How often lifecycle rules are evaluated
+  root_dir: "./.cloodsys3/data"        # Root directory for object files (per-bucket overrides via
+                                       # `bucket create --storage-dir` / `bucket storage --dir`)
+  multipart_max_age: "24h"             # Incomplete multipart uploads older than this are removed
+  lifecycle_interval: "1h"             # How often lifecycle rules and cleanups run
 
 logging:
-  level: "info"                # Log level: debug, info, warn, error
-  format: "text"               # Log format: text or json
+  level: "info"                # debug, info, warn, error
+  format: "text"               # text (human readable) or json (for log shippers)
 
 admin:
-  enabled: false               # Enable the Admin API (used by the Flutter GUI)
-  listen: ":9001"              # Admin API port (separate from the S3 API)
-  cors_origins:                # Allowed origins (for the Flutter web build)
-    - "*"
+  enabled: false               # Enable the Admin REST API (used by the GUI and automation)
+  listen: ":9001"              # Admin API address; bind to 127.0.0.1 or enable tls when exposed
+  cors_origins: []             # Origins allowed to call the Admin API from a browser (e.g. ["*"] for the
+                               # Flutter web build during development)
+  tls:                         # Per-listener TLS (never enabled implicitly). Set enabled: true and
+    enabled: false             # leave cert_file/key_file empty to reuse the server.tls certificate.
+    cert_file: ""
+    key_file: ""
+  trusted_proxies: []          # IPs/CIDRs whose X-Forwarded-For is trusted for login rate limiting,
+                               # e.g. ["127.0.0.1", "10.0.0.0/8"]. Empty = the header is ignored.
+  session_ttl: "8h"            # Lifetime of admin session tokens (in-memory, cleared on restart)
 
 image:
   enabled: false               # Automatic image optimization on upload (original is preserved)
-  sync_max_bytes: 2000000      # Images <= this size are optimized synchronously, larger ones asynchronously
-  quality: 75                  # JPEG quality (1-100)
-  workers: 2                   # Number of async optimization workers
-  queue_size: 256              # Async queue buffer size
+  sync_max_bytes: 2000000      # Images <= this size are optimized inline, larger ones in the background
+  quality: 75                  # JPEG quality (1-100) for optimized variants and ?q= default
+  workers: 2                   # Background optimization workers
+  queue_size: 256              # Background queue buffer size
+  max_source_bytes: 33554432   # Never decode images larger than this (32 MB) - bounds memory use
+  max_concurrent: 4            # Simultaneous decodes across ?w=/?h= transforms and the optimizer
+  cache_max_bytes: 1073741824  # Per-bucket variant cache size (1 GB); oldest variants are evicted.
+                               # 0 or negative = unlimited
+  dimension_step: 16           # Requested widths/heights are rounded up to a multiple of this so the
+                               # number of distinct variants per object stays bounded (1 = exact sizes)
 
 webdav:
   enabled: false               # Run the WebDAV server (master switch)
-  listen: ":9002"              # WebDAV port (separate from the S3 and Admin ports)
+  listen: ":9002"              # WebDAV address (separate from the S3 and Admin ports)
   prefix: "/"                  # URL path prefix
+  tls:                         # Per-listener TLS; enabled: true with empty cert/key reuses server.tls.
+    enabled: false             # Windows refuses Basic auth over plain HTTP by default, so TLS is
+    cert_file: ""              # strongly recommended when WebDAV is reachable from other hosts.
+    key_file: ""
+  lock_timeout: "10m"          # Maximum WebDAV lock lifetime (clients that omit Timeout get this)
   # Even with the master switch on, every bucket is OFF by default; enable per bucket:
   #   cloodsys3 bucket webdav enable <bucket>   (or in the GUI: Settings > WebDAV Access)
   # Login: username = access key, password = secret key (one credential = one bucket)
+
+update:
+  check_on_start: true         # Query GitHub once at start-up and log when a newer release exists.
+                               # Set to false for air-gapped or privacy-sensitive deployments.
+                               # `cloodsys3 update` verifies SHA-256 checksums before installing.

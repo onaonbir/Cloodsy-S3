@@ -42,11 +42,11 @@ func OpenWithConfig(cfg DBConfig) (*DB, error) {
 		}
 	}
 
-	writerDSN := fmt.Sprintf("%s?_txlock=immediate&_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)&_pragma=journal_size_limit(67108864)&_pragma=synchronous(NORMAL)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)&_pragma=temp_store(MEMORY)",
-		cfg.Path, cfg.BusyTimeout, cfg.CacheSize, cfg.MmapSize)
-
-	readerDSN := fmt.Sprintf("%s?_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)&_pragma=temp_store(MEMORY)&_pragma=query_only(1)",
-		cfg.Path, cfg.BusyTimeout, cfg.CacheSize, cfg.MmapSize)
+	// case_sensitive_like(1): prefix matching must be byte-exact like S3.
+	common := fmt.Sprintf("_pragma=journal_mode(WAL)&_pragma=foreign_keys(1)&_pragma=busy_timeout(%d)&_pragma=cache_size(-%d)&_pragma=mmap_size(%d)&_pragma=temp_store(MEMORY)&_pragma=case_sensitive_like(1)",
+		cfg.BusyTimeout, cfg.CacheSize, cfg.MmapSize)
+	writerDSN := fmt.Sprintf("%s?_txlock=immediate&%s&_pragma=journal_size_limit(67108864)&_pragma=synchronous(NORMAL)", cfg.Path, common)
+	readerDSN := fmt.Sprintf("%s?%s&_pragma=query_only(1)", cfg.Path, common)
 
 	writer, err := sql.Open("sqlite", writerDSN)
 	if err != nil {
@@ -152,6 +152,65 @@ func (d *DB) WriteTx(ctx context.Context, fn func(tx *sql.Tx) error) error {
 	})
 }
 
+// GetMeta / SetMeta store small key/value settings (e.g. storage layout version).
+func (d *DB) GetMeta(key string) (string, error) {
+	var v string
+	err := d.reader.QueryRow("SELECT value FROM meta WHERE key = ?", key).Scan(&v)
+	if err == sql.ErrNoRows {
+		return "", nil
+	}
+	return v, err
+}
+
+func (d *DB) SetMeta(key, value string) error {
+	return d.withRetry(func() error {
+		_, err := d.writer.Exec("INSERT INTO meta (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value", key, value)
+		return err
+	})
+}
+
+// migration is one schema step. Steps are applied in order exactly once and
+// recorded in schema_migrations. Every step must be safe to run on a database
+// created by any earlier version (the base schema is created with IF NOT
+// EXISTS, and ALTER TABLE ... ADD COLUMN steps tolerate an existing column).
+type migration struct {
+	version int
+	stmts   []string
+}
+
+var migrations = []migration{
+	{1, []string{
+		"ALTER TABLE buckets ADD COLUMN quota_bytes INTEGER DEFAULT 0",
+		"ALTER TABLE bucket_credentials ADD COLUMN permission TEXT DEFAULT 'read-write'",
+		"ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE objects ADD COLUMN version_id TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE objects ADD COLUMN is_latest INTEGER NOT NULL DEFAULT 1",
+		"ALTER TABLE objects ADD COLUMN is_delete_marker INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE buckets ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE bucket_credentials ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE bucket_webhooks ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE lifecycle_rules ADD COLUMN name TEXT NOT NULL DEFAULT ''",
+		"ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE buckets ADD COLUMN webdav_enabled INTEGER NOT NULL DEFAULT 0",
+		"CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects(bucket_id, key)",
+		"CREATE INDEX IF NOT EXISTS idx_objects_bucket_key_version ON objects(bucket_id, key, version_id)",
+	}},
+	{2, []string{
+		// Lifecycle: rule status + noncurrent/abort actions.
+		"ALTER TABLE lifecycle_rules ADD COLUMN status TEXT NOT NULL DEFAULT 'Enabled'",
+		"ALTER TABLE lifecycle_rules ADD COLUMN noncurrent_days INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE lifecycle_rules ADD COLUMN abort_multipart_days INTEGER NOT NULL DEFAULT 0",
+		"ALTER TABLE lifecycle_rules ADD COLUMN expire_delete_markers INTEGER NOT NULL DEFAULT 0",
+		// Listing index: only current, non-marker rows are ever listed.
+		"CREATE INDEX IF NOT EXISTS idx_objects_listing ON objects(bucket_id, key) WHERE is_latest = 1 AND is_delete_marker = 0",
+		"DROP INDEX IF EXISTS idx_objects_bucket_latest",
+		// Legacy databases may hold several is_latest=1 rows for one key
+		// (created by pre-fix WebDAV writes). Keep only the newest.
+		`UPDATE objects SET is_latest = 0 WHERE is_latest = 1 AND id NOT IN (
+			SELECT MAX(id) FROM objects WHERE is_latest = 1 GROUP BY bucket_id, key)`,
+	}},
+}
+
 func (d *DB) migrate() error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS buckets (
@@ -237,49 +296,60 @@ func (d *DB) migrate() error {
 		created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
 		FOREIGN KEY (bucket_name) REFERENCES buckets(name) ON DELETE CASCADE
 	);
+
+	CREATE TABLE IF NOT EXISTS schema_migrations (
+		version INTEGER PRIMARY KEY,
+		applied_at DATETIME DEFAULT CURRENT_TIMESTAMP
+	);
+
+	CREATE TABLE IF NOT EXISTS meta (
+		key TEXT PRIMARY KEY,
+		value TEXT NOT NULL
+	);
 	`
 
 	if _, err := d.writer.Exec(schema); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
 
-	// Add columns for existing databases (idempotent)
-	migrations := []string{
-		"ALTER TABLE buckets ADD COLUMN quota_bytes INTEGER DEFAULT 0",
-		"ALTER TABLE bucket_credentials ADD COLUMN permission TEXT DEFAULT 'read-write'",
-		"ALTER TABLE buckets ADD COLUMN versioning TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE objects ADD COLUMN version_id TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE objects ADD COLUMN is_latest INTEGER NOT NULL DEFAULT 1",
-		"ALTER TABLE objects ADD COLUMN is_delete_marker INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE buckets ADD COLUMN storage_dir TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE bucket_credentials ADD COLUMN name TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE bucket_webhooks ADD COLUMN name TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE lifecycle_rules ADD COLUMN name TEXT NOT NULL DEFAULT ''",
-		"ALTER TABLE buckets ADD COLUMN public_read INTEGER NOT NULL DEFAULT 0",
-		"ALTER TABLE buckets ADD COLUMN webdav_enabled INTEGER NOT NULL DEFAULT 0",
+	applied := map[int]bool{}
+	rows, err := d.writer.Query("SELECT version FROM schema_migrations")
+	if err != nil {
+		return fmt.Errorf("read schema_migrations: %w", err)
 	}
+	for rows.Next() {
+		var v int
+		if err := rows.Scan(&v); err != nil {
+			rows.Close()
+			return err
+		}
+		applied[v] = true
+	}
+	rows.Close()
+
 	for _, m := range migrations {
-		_, err := d.writer.Exec(m)
-		if err != nil {
-			// Ignore "duplicate column" errors which are expected for existing databases
-			errMsg := err.Error()
-			if !strings.Contains(errMsg, "duplicate column") && !strings.Contains(errMsg, "already exists") {
-				return fmt.Errorf("migration failed: %s: %w", m, err)
+		if applied[m.version] {
+			continue
+		}
+		err := d.WriteTx(context.Background(), func(tx *sql.Tx) error {
+			for _, stmt := range m.stmts {
+				if _, err := tx.Exec(stmt); err != nil {
+					msg := err.Error()
+					// ADD COLUMN on a column that already exists (databases
+					// created before schema_migrations existed) is fine.
+					if strings.HasPrefix(strings.TrimSpace(stmt), "ALTER TABLE") &&
+						(strings.Contains(msg, "duplicate column") || strings.Contains(msg, "already exists")) {
+						continue
+					}
+					return fmt.Errorf("migration %d failed: %s: %w", m.version, stmt, err)
+				}
 			}
+			_, err := tx.Exec("INSERT INTO schema_migrations (version) VALUES (?)", m.version)
+			return err
+		})
+		if err != nil {
+			return err
 		}
 	}
-
-	// Create indexes for object listing performance (idempotent)
-	indexes := []string{
-		"CREATE INDEX IF NOT EXISTS idx_objects_bucket_key ON objects(bucket_id, key)",
-		"CREATE INDEX IF NOT EXISTS idx_objects_bucket_key_version ON objects(bucket_id, key, version_id)",
-		"CREATE INDEX IF NOT EXISTS idx_objects_bucket_latest ON objects(bucket_id, is_latest)",
-	}
-	for _, idx := range indexes {
-		if _, err := d.writer.Exec(idx); err != nil {
-			return fmt.Errorf("create index failed: %s: %w", idx, err)
-		}
-	}
-
 	return nil
 }
