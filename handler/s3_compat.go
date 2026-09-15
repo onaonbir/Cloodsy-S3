@@ -11,7 +11,10 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/db"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 	"github.com/onaonbir/Cloodsy-S3/s3xml"
+	"github.com/onaonbir/Cloodsy-S3/storage"
 )
+
+var defaultOwner = s3xml.Owner{ID: "cloodsys3", DisplayName: "cloodsys3"}
 
 // --- 1. GetBucketLocation ---
 
@@ -50,11 +53,11 @@ func (h *Handler) ListMultipartUploads(w http.ResponseWriter, r *http.Request) {
 	prefix := query.Get("prefix")
 	keyMarker := query.Get("key-marker")
 	uploadIDMarker := query.Get("upload-id-marker")
-	maxUploads := 1000
-	if v := query.Get("max-uploads"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 && n <= 1000 {
-			maxUploads = n
-		}
+	encodingType := query.Get("encoding-type")
+	maxUploads, ok := parseMaxKeys(query.Get("max-uploads"))
+	if !ok {
+		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+		return
 	}
 
 	uploads, truncated, err := h.DB.ListMultipartUploads(bucket.ID, prefix, keyMarker, uploadIDMarker, maxUploads)
@@ -71,22 +74,27 @@ func (h *Handler) ListMultipartUploads(w http.ResponseWriter, r *http.Request) {
 		UploadIdMarker: uploadIDMarker,
 		MaxUploads:     maxUploads,
 		IsTruncated:    truncated,
-		Prefix:         prefix,
+		Prefix:         EncodeKeyIfNeeded(prefix, encodingType),
 		Delimiter:      query.Get("delimiter"),
+	}
+	if encodingType == "url" {
+		result.EncodingType = "url"
 	}
 
 	for _, u := range uploads {
 		result.Uploads = append(result.Uploads, s3xml.MultipartUploadEntry{
-			Key:          u.Key,
+			Key:          EncodeKeyIfNeeded(u.Key, encodingType),
 			UploadId:     u.ID,
-			Initiated:    u.CreatedAt.UTC().Format(time.RFC3339),
+			Initiator:    defaultOwner,
+			Owner:        defaultOwner,
+			Initiated:    u.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			StorageClass: "STANDARD",
 		})
 	}
 
 	if truncated && len(uploads) > 0 {
 		last := uploads[len(uploads)-1]
-		result.NextKeyMarker = last.Key
+		result.NextKeyMarker = EncodeKeyIfNeeded(last.Key, encodingType)
 		result.NextUploadIdMarker = last.ID
 	}
 
@@ -108,13 +116,7 @@ func (h *Handler) ListParts(w http.ResponseWriter, r *http.Request) {
 
 	uploadID := r.URL.Query().Get("uploadId")
 	upload, err := h.DB.GetMultipartUpload(uploadID)
-	if err != nil || upload == nil {
-		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
-		return
-	}
-
-	// Validate upload belongs to the requested bucket (prevent cross-bucket hijacking)
-	if upload.BucketID != bucket.ID {
+	if err != nil || upload == nil || upload.BucketID != bucket.ID {
 		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
 		return
 	}
@@ -126,31 +128,47 @@ func (h *Handler) ListParts(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	maxParts := 1000
-	if v := r.URL.Query().Get("max-parts"); v != "" {
-		if n, err := strconv.Atoi(v); err == nil && n > 0 {
-			maxParts = n
+	maxParts, ok := parseMaxKeys(r.URL.Query().Get("max-parts"))
+	if !ok {
+		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+		return
+	}
+	marker := 0
+	if v := r.URL.Query().Get("part-number-marker"); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n >= 0 {
+			marker = n
 		}
 	}
-
-	truncated := len(parts) > maxParts
+	filtered := parts[:0:0]
+	for _, p := range parts {
+		if p.PartNumber > marker {
+			filtered = append(filtered, p)
+		}
+	}
+	truncated := len(filtered) > maxParts
 	if truncated {
-		parts = parts[:maxParts]
+		filtered = filtered[:maxParts]
 	}
 
 	result := s3xml.ListPartsResult{
-		Xmlns:       "http://s3.amazonaws.com/doc/2006-03-01/",
-		Bucket:      bucketName,
-		Key:         key,
-		UploadId:    uploadID,
-		MaxParts:    maxParts,
-		IsTruncated: truncated,
+		Xmlns:            "http://s3.amazonaws.com/doc/2006-03-01/",
+		Bucket:           bucketName,
+		Key:              key,
+		UploadId:         uploadID,
+		Initiator:        defaultOwner,
+		Owner:            defaultOwner,
+		StorageClass:     "STANDARD",
+		PartNumberMarker: marker,
+		MaxParts:         maxParts,
+		IsTruncated:      truncated,
 	}
-
-	for _, p := range parts {
+	if truncated && len(filtered) > 0 {
+		result.NextPartNumberMarker = filtered[len(filtered)-1].PartNumber
+	}
+	for _, p := range filtered {
 		result.Parts = append(result.Parts, s3xml.PartEntry{
 			PartNumber:   p.PartNumber,
-			LastModified: p.CreatedAt.UTC().Format(time.RFC3339),
+			LastModified: p.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 			ETag:         p.ETag,
 			Size:         p.Size,
 		})
@@ -179,9 +197,12 @@ func (h *Handler) GetObjectAcl(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
+	bucketName, key := getBucketAndKey(r)
+	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
 	if !ok {
+		return
+	}
+	if h.lookupObject(w, r, bucket, key) == nil {
 		return
 	}
 	h.writeACL(w)
@@ -190,7 +211,7 @@ func (h *Handler) GetObjectAcl(w http.ResponseWriter, r *http.Request) {
 func (h *Handler) writeACL(w http.ResponseWriter) {
 	result := s3xml.AccessControlPolicy{
 		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
-		Owner: s3xml.Owner{ID: "cloodsys3", DisplayName: "cloodsys3"},
+		Owner: defaultOwner,
 		AccessControlList: s3xml.ACL{
 			Grants: []s3xml.Grant{{
 				Grantee: s3xml.Grantee{
@@ -206,85 +227,100 @@ func (h *Handler) writeACL(w http.ResponseWriter) {
 	h.writeXML(w, http.StatusOK, result)
 }
 
-// PutBucketAcl / PutObjectAcl — accept and ignore
-func (h *Handler) PutBucketAcl(w http.ResponseWriter, r *http.Request) {
+// acceptAndIgnore authenticates a write on a bucket sub-resource we do not
+// model (ACL, tagging, policy, encryption) and returns the given status.
+func (h *Handler) acceptAndIgnore(w http.ResponseWriter, r *http.Request, status int, needObject bool) {
 	cred, ok := h.authenticateRequest(w, r)
 	if !ok {
 		return
 	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
+	if !h.checkWriteAccess(w, r, cred) {
+		return
+	}
+	bucketName, key := getBucketAndKey(r)
+	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
 	if !ok {
 		return
 	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusOK)
+	if needObject && h.lookupObject(w, r, bucket, key) == nil {
+		return
+	}
+	io.Copy(io.Discard, io.LimitReader(r.Body, maxXMLBodySize))
+	w.WriteHeader(status)
+}
+
+// PutBucketAcl / PutObjectAcl — accept and ignore
+func (h *Handler) PutBucketAcl(w http.ResponseWriter, r *http.Request) {
+	h.acceptAndIgnore(w, r, http.StatusOK, false)
 }
 
 func (h *Handler) PutObjectAcl(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusOK)
+	h.acceptAndIgnore(w, r, http.StatusOK, true)
 }
 
 // --- 5. Conditional request helpers ---
 
-// CheckConditionalHeaders checks If-Match, If-None-Match, If-Modified-Since, If-Unmodified-Since.
-// Returns true if the request should proceed, false if a 304/412 was sent.
-func (h *Handler) CheckConditionalHeaders(w http.ResponseWriter, r *http.Request, etag string, lastModified time.Time) bool {
-	// If-Match: proceed only if ETag matches
+// checkConditional evaluates If-Match / If-None-Match / If-Modified-Since /
+// If-Unmodified-Since in RFC 7232 order for an object row.
+func (h *Handler) checkConditional(w http.ResponseWriter, r *http.Request, meta *db.ObjectMeta) bool {
+	return h.checkConditionalETag(w, r, meta.ETag, meta.LastModified)
+}
+
+func (h *Handler) checkConditionalETag(w http.ResponseWriter, r *http.Request, etag string, lastModified time.Time) bool {
+	lm := lastModified.UTC().Truncate(time.Second)
+	fail := func(status int) bool {
+		w.Header().Set("ETag", etag)
+		w.Header().Set("Last-Modified", lastModified.UTC().Format(http.TimeFormat))
+		if status == http.StatusPreconditionFailed {
+			s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+		} else {
+			w.WriteHeader(status)
+		}
+		return false
+	}
+
 	if im := r.Header.Get("If-Match"); im != "" {
 		if !etagMatch(im, etag) {
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return false
+			return fail(http.StatusPreconditionFailed)
+		}
+	} else if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
+		if t, err := http.ParseTime(ius); err == nil && lm.After(t) {
+			return fail(http.StatusPreconditionFailed)
 		}
 	}
 
-	// If-None-Match: proceed only if ETag does NOT match (used for caching)
 	if inm := r.Header.Get("If-None-Match"); inm != "" {
 		if etagMatch(inm, etag) {
-			w.WriteHeader(http.StatusNotModified)
-			return false
+			if r.Method == http.MethodGet || r.Method == http.MethodHead {
+				return fail(http.StatusNotModified)
+			}
+			return fail(http.StatusPreconditionFailed)
+		}
+	} else if ims := r.Header.Get("If-Modified-Since"); ims != "" && (r.Method == http.MethodGet || r.Method == http.MethodHead) {
+		if t, err := http.ParseTime(ims); err == nil && !lm.After(t) {
+			return fail(http.StatusNotModified)
 		}
 	}
-
-	// If-Modified-Since: return 304 if not modified after the given date
-	if ims := r.Header.Get("If-Modified-Since"); ims != "" {
-		t, err := http.ParseTime(ims)
-		if err == nil && !lastModified.After(t) {
-			w.WriteHeader(http.StatusNotModified)
-			return false
-		}
-	}
-
-	// If-Unmodified-Since: return 412 if modified after the given date
-	if ius := r.Header.Get("If-Unmodified-Since"); ius != "" {
-		t, err := http.ParseTime(ius)
-		if err == nil && lastModified.After(t) {
-			w.WriteHeader(http.StatusPreconditionFailed)
-			return false
-		}
-	}
-
 	return true
 }
 
+// CheckConditionalHeaders is kept for callers outside this package.
+func (h *Handler) CheckConditionalHeaders(w http.ResponseWriter, r *http.Request, etag string, lastModified time.Time) bool {
+	return h.checkConditionalETag(w, r, etag, lastModified)
+}
+
 func etagMatch(header, etag string) bool {
-	if header == "*" {
+	if strings.TrimSpace(header) == "*" {
 		return true
 	}
-	// Handle comma-separated list of ETags
+	norm := func(s string) string {
+		s = strings.TrimSpace(s)
+		s = strings.TrimPrefix(s, "W/")
+		return strings.Trim(s, "\"")
+	}
+	want := norm(etag)
 	for _, candidate := range strings.Split(header, ",") {
-		candidate = strings.TrimSpace(candidate)
-		if candidate == etag {
+		if norm(candidate) == want {
 			return true
 		}
 	}
@@ -309,14 +345,12 @@ func (h *Handler) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 	}
 
 	uploadID := r.URL.Query().Get("uploadId")
-	partNumberStr := r.URL.Query().Get("partNumber")
-	partNumber, err := strconv.Atoi(partNumberStr)
+	partNumber, err := strconv.Atoi(r.URL.Query().Get("partNumber"))
 	if err != nil || partNumber < 1 || partNumber > maxParts {
 		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
 		return
 	}
 
-	// Validate the upload belongs to this bucket before staging any data.
 	upload, err := h.DB.GetMultipartUpload(uploadID)
 	if err != nil {
 		h.Logger.Error("db error", "error", err)
@@ -328,73 +362,89 @@ func (h *Handler) UploadPartCopy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Parse copy source
-	copySource := r.Header.Get("X-Amz-Copy-Source")
-	if copySource == "" {
+	srcBucketName, srcKey, srcVersion, err := parseCopySource(r.Header.Get("X-Amz-Copy-Source"))
+	if err != nil || !isValidBucketName(srcBucketName) || !isValidObjectKey(srcKey) {
 		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
 		return
 	}
-	copySource, _ = url.PathUnescape(copySource)
-	copySource = strings.TrimPrefix(copySource, "/")
-	parts := strings.SplitN(copySource, "/", 2)
-	if len(parts) != 2 {
-		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+	// The credential must own the source bucket too (one credential = one bucket).
+	srcBucket, ok := h.checkBucketAccess(w, r, cred, srcBucketName)
+	if !ok {
 		return
 	}
-	srcBucket, srcKey := parts[0], parts[1]
+	var srcMeta *db.ObjectMeta
+	if srcVersion != "" {
+		srcMeta, err = h.DB.GetObjectMetaByVersion(srcBucket.ID, srcKey, srcVersion)
+	} else {
+		srcMeta, err = h.DB.GetObjectMeta(srcBucket.ID, srcKey)
+	}
+	if err != nil {
+		h.Logger.Error("db error", "error", err)
+		s3err.WriteError(w, r, s3err.ErrInternalError)
+		return
+	}
+	if srcMeta == nil || srcMeta.IsDeleteMarker {
+		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
+		return
+	}
+	if v := r.Header.Get("x-amz-copy-source-if-match"); v != "" && !etagMatch(v, srcMeta.ETag) {
+		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+		return
+	}
+	if v := r.Header.Get("x-amz-copy-source-if-none-match"); v != "" && etagMatch(v, srcMeta.ETag) {
+		s3err.WriteError(w, r, s3err.ErrPreconditionFailed)
+		return
+	}
 
-	// Get source object
-	reader, err := h.Storage.GetObject(srcBucket, srcKey)
+	reader, err := h.Objects.Open(srcBucket, srcMeta)
 	if err != nil {
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 		return
 	}
+	defer reader.Close()
 
-	// Handle range copy
 	var srcReader io.Reader = reader
-	copyRange := r.Header.Get("X-Amz-Copy-Source-Range")
-	if copyRange != "" {
-		// Parse "bytes=start-end"
-		rangeStr := strings.TrimPrefix(copyRange, "bytes=")
-		rangeParts := strings.Split(rangeStr, "-")
-		if len(rangeParts) == 2 {
-			start, err1 := strconv.ParseInt(rangeParts[0], 10, 64)
-			end, err2 := strconv.ParseInt(rangeParts[1], 10, 64)
-			if err1 == nil && err2 == nil && start >= 0 && end >= start {
-				// Skip to start
-				io.CopyN(io.Discard, reader, start)
-				srcReader = io.LimitReader(reader, end-start+1)
-			}
+	expected := srcMeta.Size
+	if copyRange := r.Header.Get("X-Amz-Copy-Source-Range"); copyRange != "" {
+		start, end, ok := parseRange(copyRange, srcMeta.Size)
+		if !ok {
+			s3err.WriteError(w, r, s3err.ErrInvalidRange)
+			return
 		}
+		if seeker, ok := reader.(io.Seeker); ok {
+			seeker.Seek(start, io.SeekStart)
+		} else {
+			io.CopyN(io.Discard, reader, start)
+		}
+		expected = end - start + 1
+		srcReader = io.LimitReader(reader, expected)
+	}
+	if expected > maxPartSize {
+		s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
+		return
 	}
 
-	// Write as multipart part
-	size, etag, err := h.Storage.PutMultipartPart(bucketName, uploadID, partNumber, srcReader)
-	reader.Close()
+	size, etag, err := h.Storage.PutMultipartPart(bucketName, uploadID, partNumber, srcReader, storage.PutOptions{MaxSize: maxPartSize})
 	if err != nil {
-		h.Logger.Error("upload part copy error", "error", err)
+		h.writeServiceError(w, r, err, "upload part copy error")
+		return
+	}
+
+	if err := h.DB.PutMultipartPart(&db.MultipartPart{UploadID: uploadID, PartNumber: partNumber, Size: size, ETag: etag}); err != nil {
+		h.Storage.DeleteMultipartPart(bucketName, uploadID, partNumber)
+		h.Logger.Error("failed to save part metadata", "error", err)
 		s3err.WriteError(w, r, s3err.ErrInternalError)
 		return
 	}
 
-	// Save part metadata
-	h.DB.PutMultipartPart(&db.MultipartPart{
-		UploadID:   uploadID,
-		PartNumber: partNumber,
-		Size:       size,
-		ETag:       etag,
-	})
-
-	// Return CopyPartResult
-	result := struct {
-		XMLName      string `xml:"CopyPartResult"`
-		ETag         string `xml:"ETag"`
-		LastModified string `xml:"LastModified"`
-	}{
-		ETag:         etag,
-		LastModified: time.Now().UTC().Format(time.RFC3339),
+	if srcBucket.Versioning != "" || srcMeta.VersionID != "" {
+		w.Header().Set("x-amz-copy-source-version-id", apiVersionID(srcMeta.VersionID))
 	}
-	h.writeXML(w, http.StatusOK, result)
+	h.writeXML(w, http.StatusOK, s3xml.CopyPartResult{
+		Xmlns:        "http://s3.amazonaws.com/doc/2006-03-01/",
+		ETag:         etag,
+		LastModified: time.Now().UTC().Format("2006-01-02T15:04:05.000Z"),
+	})
 }
 
 // --- Encryption stub ---
@@ -409,27 +459,21 @@ func (h *Handler) GetBucketEncryption(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Return default SSE-S3 (AES256)
-	w.Header().Set("Content-Type", "application/xml")
-	w.WriteHeader(http.StatusOK)
-	w.Write([]byte(`<?xml version="1.0" encoding="UTF-8"?>
-<ServerSideEncryptionConfiguration xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
-  <Rule><ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault><BucketKeyEnabled>false</BucketKeyEnabled></Rule>
-</ServerSideEncryptionConfiguration>`))
+	// Data is stored unencrypted; report that honestly (this is what S3 returns
+	// for a bucket with no default-encryption configuration).
+	s3err.WriteError(w, r, s3err.S3Error{
+		Code:       "ServerSideEncryptionConfigurationNotFoundError",
+		Message:    "The server side encryption configuration was not found",
+		HTTPStatus: http.StatusNotFound,
+	})
 }
 
 func (h *Handler) PutBucketEncryption(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusOK)
+	h.acceptAndIgnore(w, r, http.StatusOK, false)
+}
+
+func (h *Handler) DeleteBucketEncryption(w http.ResponseWriter, r *http.Request) {
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
 }
 
 // --- Tagging stubs ---
@@ -453,30 +497,11 @@ func (h *Handler) GetBucketTagging(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) PutBucketTagging(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusNoContent)
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
 }
 
 func (h *Handler) DeleteBucketTagging(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
 }
 
 func (h *Handler) GetObjectTagging(w http.ResponseWriter, r *http.Request) {
@@ -484,9 +509,12 @@ func (h *Handler) GetObjectTagging(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
+	bucketName, key := getBucketAndKey(r)
+	bucket, ok := h.checkBucketAccess(w, r, cred, bucketName)
 	if !ok {
+		return
+	}
+	if h.lookupObject(w, r, bucket, key) == nil {
 		return
 	}
 	w.Header().Set("Content-Type", "application/xml")
@@ -495,30 +523,11 @@ func (h *Handler) GetObjectTagging(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) PutObjectTagging(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusOK)
+	h.acceptAndIgnore(w, r, http.StatusOK, true)
 }
 
 func (h *Handler) DeleteObjectTagging(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	w.WriteHeader(http.StatusNoContent)
+	h.acceptAndIgnore(w, r, http.StatusNoContent, true)
 }
 
 // --- Policy stub ---
@@ -533,7 +542,6 @@ func (h *Handler) GetBucketPolicy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// No policy set — this is what real S3 returns
 	s3err.WriteError(w, r, s3err.S3Error{
 		Code:       "NoSuchBucketPolicy",
 		Message:    "The bucket policy does not exist",
@@ -542,20 +550,16 @@ func (h *Handler) GetBucketPolicy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) PutBucketPolicy(w http.ResponseWriter, r *http.Request) {
-	cred, ok := h.authenticateRequest(w, r)
-	if !ok {
-		return
-	}
-	bucketName, _ := getBucketAndKey(r)
-	_, ok = h.checkBucketAccess(w, r, cred, bucketName)
-	if !ok {
-		return
-	}
-	io.Copy(io.Discard, r.Body)
-	w.WriteHeader(http.StatusNoContent)
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
 }
 
 func (h *Handler) DeleteBucketPolicy(w http.ResponseWriter, r *http.Request) {
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
+}
+
+// --- CORS stub (S3 semantics: no configuration stored) ---
+
+func (h *Handler) GetBucketCors(w http.ResponseWriter, r *http.Request) {
 	cred, ok := h.authenticateRequest(w, r)
 	if !ok {
 		return
@@ -565,19 +569,32 @@ func (h *Handler) DeleteBucketPolicy(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	w.WriteHeader(http.StatusNoContent)
+	s3err.WriteError(w, r, s3err.S3Error{
+		Code:       "NoSuchCORSConfiguration",
+		Message:    "The CORS configuration does not exist",
+		HTTPStatus: http.StatusNotFound,
+	})
+}
+
+func (h *Handler) PutBucketCors(w http.ResponseWriter, r *http.Request) {
+	h.acceptAndIgnore(w, r, http.StatusOK, false)
+}
+
+func (h *Handler) DeleteBucketCors(w http.ResponseWriter, r *http.Request) {
+	h.acceptAndIgnore(w, r, http.StatusNoContent, false)
 }
 
 // --- EncodingType helper ---
 
+// EncodeKeyIfNeeded applies S3's encoding-type=url rules: every character that
+// is not unreserved is percent-encoded (so "+" becomes "%2B"), "/" is kept.
 func EncodeKeyIfNeeded(key, encodingType string) string {
-	if encodingType == "url" {
-		// S3 URL encoding: encode special chars but preserve /
-		segments := strings.Split(key, "/")
-		for i, seg := range segments {
-			segments[i] = url.PathEscape(seg)
-		}
-		return strings.Join(segments, "/")
+	if encodingType != "url" {
+		return key
 	}
-	return key
+	segments := strings.Split(key, "/")
+	for i, seg := range segments {
+		segments[i] = strings.ReplaceAll(url.QueryEscape(seg), "+", "%20")
+	}
+	return strings.Join(segments, "/")
 }

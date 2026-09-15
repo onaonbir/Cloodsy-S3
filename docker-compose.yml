@@ -1,0 +1,34 @@
+services:
+  cloodsys3:
+    build:
+      context: .
+      args:
+        VERSION: ${CLOODSYS3_VERSION:-dev}
+    image: cloodsys3:${CLOODSYS3_VERSION:-dev}
+    container_name: cloodsys3
+    restart: unless-stopped
+    ports:
+      - "9000:9000"          # S3 API
+      # Admin API and WebDAV carry credentials: keep them bound to localhost
+      # (or put a TLS reverse proxy in front) unless TLS is configured.
+      - "127.0.0.1:9001:9001" # Admin API (CLOODSYS3_ADMIN_ENABLED=true)
+      # - "9002:9002"        # WebDAV (CLOODSYS3_WEBDAV_ENABLED=true)
+    environment:
+      CLOODSYS3_ADMIN_ENABLED: "true"
+      CLOODSYS3_LOG_FORMAT: "json"
+      # CLOODSYS3_REGION: "us-east-1"
+      # CLOODSYS3_WEBDAV_ENABLED: "true"
+      # CLOODSYS3_CONFIG: /config/config.yaml   # for settings without an env override
+    volumes:
+      - cloodsys3-data:/data
+      # - ./config.yaml:/config/config.yaml:ro
+      # - ./certs:/certs:ro                     # then set CLOODSYS3_TLS_* in environment
+    stop_grace_period: 30s
+
+volumes:
+  cloodsys3-data:
+
+# Manage buckets and credentials with the same binary inside the container:
+#   docker compose exec cloodsys3 /cloodsys3 bucket create my-bucket
+#   docker compose exec cloodsys3 /cloodsys3 credential create my-bucket
+#   docker compose exec -it cloodsys3 /cloodsys3 admin create admin --generate

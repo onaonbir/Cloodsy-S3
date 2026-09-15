@@ -10,81 +10,113 @@ permissions:
 
 env:
   FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+  # Pure-Go stack (sqlite via modernc.org/sqlite) — cgo is never needed.
+  # Forcing it off makes every target fully static, including the native
+  # linux/amd64 build, which otherwise links dynamically against the runner's
+  # glibc and fails on older glibc or musl systems.
+  CGO_ENABLED: 0
 
 jobs:
   release:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
 
       - name: Setup Go
-        uses: actions/setup-go@v5
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version: '1.24'
+          go-version-file: go.mod
+          check-latest: true
 
       - name: Get version from tag
         id: version
-        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> $GITHUB_OUTPUT
+        run: echo "VERSION=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Verify VERSION file matches tag
+        run: |
+          FILE_VERSION="$(tr -d '[:space:]' < VERSION)"
+          if [ "$FILE_VERSION" != "${{ steps.version.outputs.VERSION }}" ]; then
+            echo "::error::VERSION file ($FILE_VERSION) does not match tag (${{ steps.version.outputs.VERSION }})"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test ./...
+
+      - name: Vulnerability check
+        uses: golang/govulncheck-action@032d45514ae346b1db93c04b0c90b841c370344f # v1.1.0
+        with:
+          go-version-file: go.mod
+          go-package: ./...
 
       - name: Build all platforms
         env:
-          # Pure-Go stack (sqlite via modernc.org/sqlite) — cgo is never needed.
-          # Forcing it off makes EVERY target fully static, including the native
-          # linux/amd64 build, which otherwise links dynamically against the
-          # runner's glibc and fails to run on older glibc or musl systems.
-          CGO_ENABLED: 0
           VERSION: ${{ steps.version.outputs.VERSION }}
           COMMIT: ${{ github.sha }}
-          BUILD_DATE: ${{ github.event.head_commit.timestamp }}
         run: |
-          LDFLAGS="-s -w -X 'main.Version=${VERSION}' -X 'main.CommitHash=${COMMIT:0:7}' -X 'main.BuildDate=${BUILD_DATE}'"
-          mkdir -p dist
+          BUILD_DATE="$(date -u '+%Y-%m-%dT%H:%M:%SZ')"
+          LDFLAGS="-s -w -X main.Version=${VERSION} -X main.CommitHash=${COMMIT:0:7} -X main.BuildDate=${BUILD_DATE}"
+          mkdir -p bin
 
-          echo "Building Linux amd64..."
-          GOOS=linux GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-amd64 .
-
-          echo "Building Linux arm64 (Raspberry Pi)..."
-          GOOS=linux GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-arm64 .
-
-          echo "Building Linux armv7..."
-          GOOS=linux GOARCH=arm GOARM=7 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-linux-armv7 .
-
-          echo "Building Windows amd64..."
-          GOOS=windows GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-windows-amd64.exe .
-
-          echo "Building macOS arm64 (Apple Silicon)..."
-          GOOS=darwin GOARCH=arm64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-darwin-arm64 .
-
-          echo "Building macOS amd64 (Intel)..."
-          GOOS=darwin GOARCH=amd64 go build -ldflags "${LDFLAGS}" -o dist/cloodsys3-darwin-amd64 .
+          build() { # os arch out [GOARM]
+            echo "Building $1/$2..."
+            GOOS="$1" GOARCH="$2" GOARM="${4:-}" go build -trimpath -ldflags "${LDFLAGS}" -o "bin/$3" .
+          }
+          build linux   amd64 cloodsys3-linux-amd64
+          build linux   arm64 cloodsys3-linux-arm64
+          build linux   arm   cloodsys3-linux-armv7 7
+          build windows amd64 cloodsys3-windows-amd64.exe
+          build darwin  arm64 cloodsys3-darwin-arm64
+          build darwin  amd64 cloodsys3-darwin-amd64
 
           echo "All builds complete."
-          ls -lh dist/
+          ls -lh bin/
 
       - name: Create archives
         run: |
-          cd dist
-
-          # Linux & macOS — tar.gz
-          for f in cloodsys3-linux-amd64 cloodsys3-linux-arm64 cloodsys3-linux-armv7 cloodsys3-darwin-arm64 cloodsys3-darwin-amd64; do
-            tar czf "${f}.tar.gz" "${f}"
+          set -euo pipefail
+          mkdir -p dist
+          # Every archive contains the binary as "cloodsys3" (or cloodsys3.exe),
+          # LICENSE and THIRD_PARTY_LICENSES.md. The self-updater and install.sh
+          # extract the entry by that exact name.
+          for target in linux-amd64 linux-arm64 linux-armv7 darwin-arm64 darwin-amd64; do
+            pkg="pkg/${target}"
+            mkdir -p "${pkg}"
+            cp "bin/cloodsys3-${target}" "${pkg}/cloodsys3"
+            cp LICENSE THIRD_PARTY_LICENSES.md "${pkg}/"
+            tar -C "${pkg}" -czf "dist/cloodsys3-${target}.tar.gz" cloodsys3 LICENSE THIRD_PARTY_LICENSES.md
           done
 
-          # Windows — zip
-          zip cloodsys3-windows-amd64.zip cloodsys3-windows-amd64.exe
+          pkg="pkg/windows-amd64"
+          mkdir -p "${pkg}"
+          cp bin/cloodsys3-windows-amd64.exe "${pkg}/cloodsys3.exe"
+          cp LICENSE THIRD_PARTY_LICENSES.md "${pkg}/"
+          (cd "${pkg}" && zip -q ../../dist/cloodsys3-windows-amd64.zip cloodsys3.exe LICENSE THIRD_PARTY_LICENSES.md)
 
-          # Checksums
-          sha256sum *.tar.gz *.zip > checksums.txt
-
+          (cd dist && sha256sum *.tar.gz *.zip > checksums.txt)
           echo "Archives:"
-          ls -lh *.tar.gz *.zip checksums.txt
+          ls -lh dist/
+          cat dist/checksums.txt
+
+      - name: Smoke test archive layout
+        run: |
+          set -euo pipefail
+          tmp="$(mktemp -d)"
+          tar -xzf dist/cloodsys3-linux-amd64.tar.gz -C "$tmp"
+          test -f "$tmp/cloodsys3" && test -f "$tmp/LICENSE" && test -f "$tmp/THIRD_PARTY_LICENSES.md"
+          "$tmp/cloodsys3" version | head -1 | grep -q "v${{ steps.version.outputs.VERSION }}"
+          (cd dist && sha256sum -c checksums.txt)
 
       - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@efb35369e0ad2afab669f228072c1b0d510eae64 # v3.0.3
         with:
           name: "Cloodsy S3 v${{ steps.version.outputs.VERSION }}"
           generate_release_notes: true
+          fail_on_unmatched_files: true
           files: |
             dist/cloodsys3-linux-amd64.tar.gz
             dist/cloodsys3-linux-arm64.tar.gz

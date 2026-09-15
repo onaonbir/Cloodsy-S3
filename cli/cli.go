@@ -1,23 +1,29 @@
 package cli
 
 import (
-	"crypto/rand"
-	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 
 	"github.com/onaonbir/Cloodsy-S3/auth"
 	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/db"
 	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/storage"
+	"github.com/onaonbir/Cloodsy-S3/webhook"
 	"github.com/pterm/pterm"
 	"golang.org/x/crypto/bcrypt"
 )
+
+// restartWarning is printed after any CLI change the running server caches in
+// memory (per-bucket storage directories).
+const restartWarning = "A running server caches bucket storage locations: restart it (or make this change through the admin API) for the new location to take effect."
 
 // validBucketName matches S3 bucket naming rules: 3-63 chars, lowercase alphanumeric + hyphens.
 var validBucketName = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
@@ -57,7 +63,9 @@ func RunBucketCreate(database *db.DB, name, storageRoot, customStorageDir string
 	pterm.Success.Printfln("Bucket '%s' created (id=%d)", bucket.Name, bucket.ID)
 	pterm.Info.Printfln("Storage: %s/", storagePath)
 	if customStorageDir != "" {
-		pterm.Info.Printfln("Custom storage directory")
+		pterm.Info.Println("Custom storage directory")
+		pterm.Warning.Println(restartWarning)
+		pterm.Info.Println("systemd: add the directory to ReadWritePaths= in a drop-in, see cloodsys3.service.")
 	}
 	return nil
 }
@@ -83,7 +91,11 @@ func RunBucketList(database *db.DB) error {
 	return nil
 }
 
-func RunBucketDelete(database *db.DB, name, storageRoot string) error {
+// RunBucketDelete removes a bucket. Unless force is set it refuses when any
+// object row (current, noncurrent version or delete marker) still exists.
+// On success the bucket directory and the sibling .<bucket>-multipart and
+// .<bucket>-cache trees are removed from disk.
+func RunBucketDelete(database *db.DB, name, storageRoot string, force bool) error {
 	if !validBucketName.MatchString(name) {
 		return fmt.Errorf("invalid bucket name '%s'", name)
 	}
@@ -96,39 +108,93 @@ func RunBucketDelete(database *db.DB, name, storageRoot string) error {
 		return fmt.Errorf("bucket '%s' not found", name)
 	}
 
-	hasObjects, err := database.BucketHasObjects(bucket.ID)
+	hasRows, err := database.BucketHasAnyRows(bucket.ID)
 	if err != nil {
 		return fmt.Errorf("check objects: %w", err)
 	}
-	if hasObjects {
-		return fmt.Errorf("bucket '%s' is not empty", name)
+	if hasRows && !force {
+		return fmt.Errorf("bucket '%s' still contains objects, noncurrent versions or delete markers; re-run with --force to delete everything", name)
+	}
+
+	// Resolve the on-disk location before the row disappears.
+	store, err := storage.NewFileSystem(storageRoot)
+	if err != nil {
+		return fmt.Errorf("open storage: %w", err)
+	}
+	if bucket.StorageDir != "" {
+		store.LoadBucketDirs(map[string]string{name: bucket.StorageDir})
 	}
 
 	if err := database.DeleteBucket(name); err != nil {
 		return fmt.Errorf("delete bucket: %w", err)
 	}
 
-	// Remove storage directory using safe path join
-	base := storageRoot
-	if bucket.StorageDir != "" {
-		base = bucket.StorageDir
+	// Removes <base>/<bucket>, <base>/.<bucket>-multipart and <base>/.<bucket>-cache.
+	if err := store.DeleteBucketDir(name); err != nil {
+		pterm.Warning.Printfln("Bucket row deleted but storage cleanup failed: %v", err)
+		pterm.Info.Printfln("Remove the directories manually under %s", storageBase(storageRoot, bucket.StorageDir))
+		return nil
 	}
-	storagePath := filepath.Join(base, name)
-	os.RemoveAll(storagePath)
 
-	// Also wipe the sibling multipart staging tree so abandoned parts don't
-	// linger on disk. DB rows for active uploads are cascade-deleted along
-	// with the bucket; this just cleans the matching files.
-	multipartPath := filepath.Join(base, "."+name+"-multipart")
-	os.RemoveAll(multipartPath)
-
-	pterm.Success.Printfln("Bucket '%s' deleted.", name)
+	if hasRows {
+		pterm.Success.Printfln("Bucket '%s' and all of its data deleted.", name)
+	} else {
+		pterm.Success.Printfln("Bucket '%s' deleted.", name)
+	}
 	return nil
 }
 
+// storageBase returns the effective base directory for a bucket.
+func storageBase(storageRoot, custom string) string {
+	if custom != "" {
+		return custom
+	}
+	return storageRoot
+}
+
+// isCrossDevice reports whether a rename failed because source and target
+// live on different filesystems.
+func isCrossDevice(err error) bool {
+	if errors.Is(err, syscall.EXDEV) {
+		return true
+	}
+	var errno syscall.Errno
+	if runtime.GOOS == "windows" && errors.As(err, &errno) && errno == 17 { // ERROR_NOT_SAME_DEVICE
+		return true
+	}
+	return false
+}
+
+// moveTree renames src to dst when src exists. It returns (moved, error).
+func moveTree(src, dst string) (bool, error) {
+	if _, err := os.Stat(src); err != nil {
+		if os.IsNotExist(err) {
+			return false, nil
+		}
+		return false, err
+	}
+	if _, err := os.Stat(dst); err == nil {
+		return false, fmt.Errorf("target '%s' already exists", dst)
+	}
+	if err := os.MkdirAll(filepath.Dir(dst), 0700); err != nil {
+		return false, err
+	}
+	if err := os.Rename(src, dst); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+// RunBucketStorageDir moves a bucket (its data directory plus the sibling
+// .<bucket>-multipart and .<bucket>-cache trees) to a new base directory and
+// records the new location. Moves are done with rename and therefore must stay
+// on one filesystem; cross-device moves are refused with manual instructions.
 func RunBucketStorageDir(database *db.DB, name, storageRoot, newDir string) error {
 	if newDir != "" && !filepath.IsAbs(newDir) {
 		return fmt.Errorf("--dir must be an absolute path, got: %s", newDir)
+	}
+	if !validBucketName.MatchString(name) {
+		return fmt.Errorf("invalid bucket name '%s'", name)
 	}
 
 	bucket, err := database.GetBucket(name)
@@ -139,73 +205,80 @@ func RunBucketStorageDir(database *db.DB, name, storageRoot, newDir string) erro
 		return fmt.Errorf("bucket '%s' not found", name)
 	}
 
-	// Determine old and new base paths
-	oldBase := storageRoot
-	if bucket.StorageDir != "" {
-		oldBase = bucket.StorageDir
+	oldBase := storageBase(storageRoot, bucket.StorageDir)
+	newBase := storageBase(storageRoot, newDir)
+	if abs, err := filepath.Abs(oldBase); err == nil {
+		oldBase = abs
 	}
-	newBase := storageRoot
-	if newDir != "" {
-		newBase = newDir
+	if abs, err := filepath.Abs(newBase); err == nil {
+		newBase = abs
 	}
-
-	oldPath := filepath.Join(oldBase, name)
-	newPath := filepath.Join(newBase, name)
-
-	if oldPath == newPath {
-		fmt.Printf("Storage directory is already '%s', nothing to change.\n", oldPath)
+	if oldBase == newBase {
+		pterm.Info.Printfln("Storage directory is already '%s', nothing to change.", filepath.Join(oldBase, name))
 		return nil
 	}
 
-	// Ensure new parent directory exists
-	if err := os.MkdirAll(newPath, 0700); err != nil {
+	trees := []string{name, "." + name + "-multipart", "." + name + "-cache"}
+	var moved []string
+	rollback := func() {
+		for i := len(moved) - 1; i >= 0; i-- {
+			os.Rename(filepath.Join(newBase, moved[i]), filepath.Join(oldBase, moved[i]))
+		}
+	}
+
+	if err := os.MkdirAll(newBase, 0700); err != nil {
 		return fmt.Errorf("create new storage dir: %w", err)
 	}
-
-	// Move files from old to new location
-	entries, err := os.ReadDir(oldPath)
-	if err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("read old storage dir: %w", err)
-	}
-
-	movedCount := 0
-	for _, entry := range entries {
-		src := filepath.Join(oldPath, entry.Name())
-		dst := filepath.Join(newPath, entry.Name())
-		if err := os.Rename(src, dst); err != nil {
-			return fmt.Errorf("move '%s': %w (partial move, %d files moved)", entry.Name(), err, movedCount)
-		}
-		movedCount++
-	}
-
-	// Remove old directory (now empty)
-	os.RemoveAll(oldPath)
-
-	// Move the sibling multipart staging tree, if any, so cleanup keeps finding it.
-	oldMultipart := filepath.Join(oldBase, "."+name+"-multipart")
-	newMultipart := filepath.Join(newBase, "."+name+"-multipart")
-	if oldMultipart != newMultipart {
-		if _, err := os.Stat(oldMultipart); err == nil {
-			if err := os.Rename(oldMultipart, newMultipart); err != nil {
-				return fmt.Errorf("move multipart staging: %w", err)
+	for _, t := range trees {
+		src := filepath.Join(oldBase, t)
+		dst := filepath.Join(newBase, t)
+		ok, err := moveTree(src, dst)
+		if err != nil {
+			rollback()
+			if isCrossDevice(err) {
+				return fmt.Errorf("cannot move '%s' to '%s': source and target are on different filesystems.\n"+
+					"Cross-filesystem moves are not done automatically. Stop the server, copy the trees manually, e.g.:\n"+
+					"  cp -a '%s' '%s/'\n"+
+					"  cp -a '%s' '%s/'   # if it exists\n"+
+					"  cp -a '%s' '%s/'   # if it exists\n"+
+					"verify the copy, delete the three old trees under '%s', then re-run this command to record the new location",
+					src, dst,
+					filepath.Join(oldBase, trees[0]), newBase,
+					filepath.Join(oldBase, trees[1]), newBase,
+					filepath.Join(oldBase, trees[2]), newBase,
+					oldBase)
 			}
+			return fmt.Errorf("move '%s': %w (nothing changed)", t, err)
+		}
+		if ok {
+			moved = append(moved, t)
+		}
+	}
+	if len(moved) == 0 {
+		// Nothing on disk yet: make sure the new data dir exists.
+		if err := os.MkdirAll(filepath.Join(newBase, name), 0700); err != nil {
+			return fmt.Errorf("create new storage dir: %w", err)
 		}
 	}
 
-	// Update DB
 	if err := database.SetBucketStorageDir(name, newDir); err != nil {
-		return fmt.Errorf("update database: %w", err)
+		rollback()
+		return fmt.Errorf("update database: %w (files moved back)", err)
 	}
 
+	newPath := filepath.Join(newBase, name)
 	if newDir != "" {
 		pterm.Success.Printfln("Bucket '%s' storage moved to: %s/ (custom)", name, newPath)
 	} else {
 		pterm.Success.Printfln("Bucket '%s' storage moved back to default: %s/", name, newPath)
 	}
-	if movedCount > 0 {
-		pterm.Info.Printfln("Moved %d items.", movedCount)
+	if len(moved) > 0 {
+		pterm.Info.Printfln("Moved: %s", strings.Join(moved, ", "))
 	}
-	pterm.Warning.Println("Restart the server for changes to take effect.")
+	pterm.Warning.Println(restartWarning)
+	if newDir != "" {
+		pterm.Info.Println("systemd: add the directory to ReadWritePaths= in a drop-in, see cloodsys3.service.")
+	}
 	return nil
 }
 
@@ -233,10 +306,10 @@ func RunBucketInfo(database *db.DB, name, storageRoot string) error {
 		return fmt.Errorf("get usage: %w", err)
 	}
 
-	storagePath := storageRoot + "/" + bucket.Name + "/"
+	storagePath := filepath.Join(storageRoot, bucket.Name) + string(filepath.Separator)
 	storageLabel := storagePath
 	if bucket.StorageDir != "" {
-		storagePath = bucket.StorageDir + "/" + bucket.Name + "/"
+		storagePath = filepath.Join(bucket.StorageDir, bucket.Name) + string(filepath.Separator)
 		storageLabel = storagePath + " (custom)"
 	}
 
@@ -501,7 +574,7 @@ func RunBucketReprocess(database *db.DB, store storage.Backend, cfg *config.Conf
 				ETag:        m.ETag,
 				ContentType: m.ContentType,
 			}
-			if err := imageutil.OptimizeOne(store, job, quality); err != nil {
+			if err := imageutil.OptimizeOne(store, job, quality, cfg.Image.MaxSourceBytes); err != nil {
 				failed++
 				pterm.Warning.Printfln("  %s: %v", m.Key, err)
 				continue
@@ -592,13 +665,39 @@ func RunBucketLifecycleGet(database *db.DB, name string) error {
 		pterm.Warning.Printfln("No lifecycle rules for bucket '%s'.", name)
 		return nil
 	}
-	tableData := pterm.TableData{{"PREFIX", "EXPIRATION DAYS", "CREATED"}}
+	tableData := pterm.TableData{{"ID", "PREFIX", "STATUS", "EXPIRE (DAYS)", "NONCURRENT (DAYS)", "ABORT MPU (DAYS)", "EXPIRE MARKERS", "CREATED"}}
+	dash := func(n int) string {
+		if n <= 0 {
+			return "-"
+		}
+		return strconv.Itoa(n)
+	}
 	for _, r := range rules {
 		prefix := r.Prefix
 		if prefix == "" {
 			prefix = "(all)"
 		}
-		tableData = append(tableData, []string{prefix, fmt.Sprintf("%d", r.ExpirationDays), r.CreatedAt.Format("2006-01-02 15:04:05")})
+		status := r.Status
+		if status == "" {
+			status = "Enabled"
+		}
+		if status == "Enabled" {
+			status = pterm.Green(status)
+		} else {
+			status = pterm.Yellow(status)
+		}
+		id := r.Name
+		if id == "" {
+			id = "-"
+		}
+		markers := "no"
+		if r.ExpireDeleteMarkers {
+			markers = "yes"
+		}
+		tableData = append(tableData, []string{
+			id, prefix, status, dash(r.ExpirationDays), dash(r.NoncurrentDays), dash(r.AbortMultipartDays), markers,
+			r.CreatedAt.Format("2006-01-02 15:04:05"),
+		})
 	}
 	pterm.DefaultTable.WithHasHeader().WithData(tableData).Render()
 	return nil
@@ -639,6 +738,13 @@ func RunBucketWebhookAdd(database *db.DB, name, url, events, secret string) erro
 	if url == "" {
 		return fmt.Errorf("--url is required")
 	}
+	// The CLI runs on the host itself, so private/loopback targets are allowed here.
+	if err := webhook.ValidateURL(url, true); err != nil {
+		return err
+	}
+	if secret != "" {
+		warnArgvSecret("--secret")
+	}
 	hook, err := database.CreateWebhook(name, "", url, events, secret)
 	if err != nil {
 		return fmt.Errorf("create webhook: %w", err)
@@ -647,7 +753,7 @@ func RunBucketWebhookAdd(database *db.DB, name, url, events, secret string) erro
 	pterm.Info.Printfln("URL:    %s", hook.URL)
 	pterm.Info.Printfln("Events: %s", hook.EventTypes)
 	if secret != "" {
-		pterm.Info.Printfln("Secret: %s", secret)
+		pterm.Info.Println("Secret: (set, not shown)")
 	}
 	return nil
 }
@@ -752,15 +858,10 @@ func formatBytes(b int64) string {
 
 // Admin CLI commands
 
-func generatePassword() (string, error) {
-	b := make([]byte, 16)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
-}
-
-func RunAdminCreate(database *db.DB, username, customPassword string) error {
+// RunAdminCreate creates an admin user. The password comes from --password
+// (discouraged: visible in argv), --generate (printed once), or an
+// interactive no-echo prompt when neither is given.
+func RunAdminCreate(database *db.DB, username, customPassword string, generate bool) error {
 	if username == "" {
 		return fmt.Errorf("username is required")
 	}
@@ -773,12 +874,9 @@ func RunAdminCreate(database *db.DB, username, customPassword string) error {
 		return fmt.Errorf("admin '%s' already exists", username)
 	}
 
-	password := customPassword
-	if password == "" {
-		password, err = generatePassword()
-		if err != nil {
-			return fmt.Errorf("generate password: %w", err)
-		}
+	password, generated, err := resolvePassword(customPassword, generate)
+	if err != nil {
+		return err
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
@@ -786,18 +884,17 @@ func RunAdminCreate(database *db.DB, username, customPassword string) error {
 		return fmt.Errorf("hash password: %w", err)
 	}
 
-	_, err = database.CreateAdmin(username, string(hash))
-	if err != nil {
+	if _, err := database.CreateAdmin(username, string(hash)); err != nil {
 		return fmt.Errorf("create admin: %w", err)
 	}
 
-	pterm.Success.Println("Admin user created")
-	panel := pterm.DefaultBox.WithTitle("Admin Credentials").Sprint(
-		pterm.Gray("Username: ") + pterm.Cyan(username) + "\n" +
-			pterm.Gray("Password: ") + pterm.Cyan(password),
-	)
-	pterm.Println(panel)
-	if customPassword == "" {
+	pterm.Success.Printfln("Admin user '%s' created.", username)
+	if generated {
+		panel := pterm.DefaultBox.WithTitle("Admin Credentials").Sprint(
+			pterm.Gray("Username: ") + pterm.Cyan(username) + "\n" +
+				pterm.Gray("Password: ") + pterm.Cyan(password),
+		)
+		pterm.Println(panel)
 		pterm.Warning.Println("Save the password now. It will not be shown again.")
 	}
 	return nil
@@ -849,7 +946,9 @@ func RunAdminDelete(database *db.DB, username string) error {
 	return nil
 }
 
-func RunAdminPassword(database *db.DB, username, customPassword string) error {
+// RunAdminPassword resets an admin's password; see RunAdminCreate for the
+// password sources. A custom password is never echoed back.
+func RunAdminPassword(database *db.DB, username, customPassword string, generate bool) error {
 	existing, err := database.GetAdmin(username)
 	if err != nil {
 		return fmt.Errorf("get admin: %w", err)
@@ -858,12 +957,9 @@ func RunAdminPassword(database *db.DB, username, customPassword string) error {
 		return fmt.Errorf("admin '%s' not found", username)
 	}
 
-	password := customPassword
-	if password == "" {
-		password, err = generatePassword()
-		if err != nil {
-			return fmt.Errorf("generate password: %w", err)
-		}
+	password, generated, err := resolvePassword(customPassword, generate)
+	if err != nil {
+		return err
 	}
 
 	hash, err := bcrypt.GenerateFromPassword([]byte(password), 12)
@@ -876,8 +972,8 @@ func RunAdminPassword(database *db.DB, username, customPassword string) error {
 	}
 
 	pterm.Success.Printfln("Password updated for '%s'.", username)
-	pterm.Info.Printfln("Password: %s", pterm.Cyan(password))
-	if customPassword == "" {
+	if generated {
+		pterm.Info.Printfln("Password: %s", pterm.Cyan(password))
 		pterm.Warning.Println("Save the password now. It will not be shown again.")
 	}
 	return nil

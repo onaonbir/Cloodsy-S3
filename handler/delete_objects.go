@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 	"github.com/onaonbir/Cloodsy-S3/s3xml"
+	"github.com/onaonbir/Cloodsy-S3/service"
 )
 
 // DeleteMultipleObjects handles POST /<bucket>?delete
@@ -13,7 +15,6 @@ func (h *Handler) DeleteMultipleObjects(w http.ResponseWriter, r *http.Request) 
 	if !ok {
 		return
 	}
-
 	if !h.checkWriteAccess(w, r, cred) {
 		return
 	}
@@ -29,42 +30,39 @@ func (h *Handler) DeleteMultipleObjects(w http.ResponseWriter, r *http.Request) 
 		s3err.WriteError(w, r, s3err.ErrMalformedXML)
 		return
 	}
-
-	// Enforce S3 batch delete limit
 	if len(deleteReq.Objects) > maxDeleteObjects {
-		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
+		s3err.WriteError(w, r, s3err.ErrMalformedXML)
 		return
 	}
 
-	result := s3xml.DeleteResult{
-		Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/",
-	}
+	result := s3xml.DeleteResult{Xmlns: "http://s3.amazonaws.com/doc/2006-03-01/"}
 
 	for _, obj := range deleteReq.Objects {
 		if !isValidObjectKey(obj.Key) {
 			result.Errors = append(result.Errors, s3xml.DeleteError{
-				Key:     obj.Key,
-				Code:    "InvalidArgument",
-				Message: "Invalid object key.",
+				Key: obj.Key, VersionId: obj.VersionId, Code: "InvalidArgument", Message: "Invalid object key.",
 			})
 			continue
 		}
-		err := h.DB.DeleteObjectMeta(bucket.ID, obj.Key)
-		if err != nil {
-			h.Logger.Error("failed to delete object metadata", "key", obj.Key, "error", err)
+		res, err := h.Objects.Delete(bucket, obj.Key, obj.VersionId)
+		if err != nil && !errors.Is(err, service.ErrNoSuchVersion) {
+			h.Logger.Error("failed to delete object", "key", obj.Key, "error", err)
 			result.Errors = append(result.Errors, s3xml.DeleteError{
-				Key:     obj.Key,
-				Code:    "InternalError",
-				Message: "We encountered an internal error. Please try again.",
+				Key: obj.Key, VersionId: obj.VersionId, Code: "InternalError", Message: "We encountered an internal error. Please try again.",
 			})
 			continue
 		}
-		if err := h.Storage.DeleteObject(bucketName, obj.Key); err != nil {
-			h.Logger.Error("failed to delete object from storage", "key", obj.Key, "error", err)
+		if deleteReq.Quiet {
+			continue
 		}
-		if !deleteReq.Quiet {
-			result.Deleted = append(result.Deleted, s3xml.DeletedObject{Key: obj.Key})
+		d := s3xml.DeletedObject{Key: obj.Key, VersionId: obj.VersionId}
+		if res != nil && res.DeleteMarker {
+			d.DeleteMarker = true
+			if obj.VersionId == "" {
+				d.DeleteMarkerVersionId = res.VersionID
+			}
 		}
+		result.Deleted = append(result.Deleted, d)
 	}
 
 	h.writeXML(w, http.StatusOK, result)

@@ -1,11 +1,15 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
 
 	"github.com/onaonbir/Cloodsy-S3/auth"
+	"github.com/onaonbir/Cloodsy-S3/httpx"
 )
+
+func validPermission(p string) bool {
+	return p == "read-write" || p == "read-only"
+}
 
 func (h *Handler) handleListCredentials(w http.ResponseWriter, r *http.Request, bucketName string) {
 	bucket, err := h.DB.GetBucket(bucketName)
@@ -27,6 +31,12 @@ func (h *Handler) handleListCredentials(w http.ResponseWriter, r *http.Request, 
 			"id":         c.ID,
 			"name":       c.Name,
 			"access_key": c.AccessKey,
+			// SECURITY NOTE: the secret is returned in clear on purpose — the
+			// Cloodsy Flutter admin GUI shows/copies it from this listing and
+			// there is no separate "reveal" endpoint. Anyone holding an admin
+			// session already has full control of every bucket, so this does
+			// not widen the trust boundary, but the admin listener must be
+			// TLS-protected or loopback-only (see admin.tls / trusted_proxies).
 			"secret_key": c.SecretKey,
 			"permission": c.Permission,
 			"created_at": c.CreatedAt.UTC().Format("2006-01-02T15:04:05Z"),
@@ -47,14 +57,20 @@ func (h *Handler) handleCreateCredential(w http.ResponseWriter, r *http.Request,
 		Name       string `json:"name"`
 		Permission string `json:"permission"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		req.Permission = "read-write"
+	// Both fields are optional so an empty body is accepted; a malformed body
+	// is rejected instead of silently minting a read-write key.
+	if !decodeJSON(w, r, &req, true) {
+		return
 	}
 	if req.Permission == "" {
 		req.Permission = "read-write"
 	}
-	if req.Permission != "read-write" && req.Permission != "read-only" {
+	if !validPermission(req.Permission) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "permission must be 'read-write' or 'read-only'"})
+		return
+	}
+	if len(req.Name) > 128 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "name too long"})
 		return
 	}
 
@@ -78,7 +94,7 @@ func (h *Handler) handleCreateCredential(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	h.Logger.Info("credential created via admin API", "bucket", bucketName, "name", req.Name, "access_key", accessKey[:6]+"***")
+	h.Logger.Info("credential created via admin API", "bucket", bucketName, "name", httpx.SanitizeLog(req.Name), "access_key", maskKey(accessKey))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"bucket":     bucketName,
 		"name":       req.Name,
@@ -106,6 +122,16 @@ func (h *Handler) handleDeleteCredential(w http.ResponseWriter, r *http.Request,
 		return
 	}
 
-	h.Logger.Info("credential deleted via admin API", "access_key", accessKey[:6]+"***")
+	h.Logger.Info("credential deleted via admin API", "access_key", maskKey(accessKey))
 	writeJSON(w, http.StatusOK, map[string]string{"message": "credential deleted"})
+}
+
+// maskKey keeps a short identifying prefix of an access key for logs. It is
+// safe for keys shorter than the prefix (the old code sliced blindly).
+func maskKey(k string) string {
+	k = httpx.SanitizeLog(k)
+	if len(k) <= 6 {
+		return "***"
+	}
+	return k[:6] + "***"
 }

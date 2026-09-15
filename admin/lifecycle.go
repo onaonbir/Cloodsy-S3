@@ -1,8 +1,8 @@
 package admin
 
 import (
-	"encoding/json"
 	"net/http"
+	"strings"
 )
 
 func (h *Handler) handleGetLifecycle(w http.ResponseWriter, r *http.Request, bucketName string) {
@@ -45,14 +45,19 @@ func (h *Handler) handleSetLifecycle(w http.ResponseWriter, r *http.Request, buc
 		Prefix         string `json:"prefix"`
 		ExpirationDays int    `json:"expiration_days"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
 	if req.ExpirationDays <= 0 {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "expiration_days must be positive"})
 		return
+	}
+	if req.Prefix != "" {
+		if strings.ContainsRune(req.Prefix, 0) || len(req.Prefix) > prefixMaxLen {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid prefix"})
+			return
+		}
 	}
 
 	if err := h.DB.PutLifecycleRule(bucketName, req.Name, req.Prefix, req.ExpirationDays); err != nil {

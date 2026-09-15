@@ -4,11 +4,12 @@
 
 **A lightweight, AWS SDK-compatible S3 server written in Go.**
 
-Ships as a single binary with zero dependencies — no CGO, no external database, no runtime requirements.
+Ships as a single static binary with zero dependencies — no CGO (pure-Go SQLite), no external database, no runtime requirements.
 All metadata is stored in an embedded SQLite database.
 
 [![Built by OnaOnbir](https://img.shields.io/badge/Built%20by-OnaOnbir-blue?style=flat-square)](https://onaonbir.com)
-[![Go](https://img.shields.io/badge/Go-1.24-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![CI](https://img.shields.io/github/actions/workflow/status/onaonbir/Cloodsy-S3/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/onaonbir/Cloodsy-S3/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/onaonbir/Cloodsy-S3?style=flat-square)](https://github.com/onaonbir/Cloodsy-S3/releases/latest)
 
 [Website](https://onaonbir.com) | [Download](https://github.com/onaonbir/Cloodsy-S3/releases/latest) | [Documentation](#quick-start)
@@ -22,8 +23,8 @@ All metadata is stored in an embedded SQLite database.
 - **AWS SDK Compatible** — Works with AWS CLI, boto3, aws-sdk-go, s3cmd, rclone, Terraform, and any S3-compatible client
 - **Single Binary** — One executable, zero dependencies, runs anywhere
 - **Per-Bucket Credentials** — Each bucket gets its own access/secret key pairs with read-write or read-only permissions
-- **Object Versioning** — Enable, suspend, or disable versioning per bucket with full delete marker support
-- **Lifecycle Rules** — Automatic object expiration based on age and prefix filters
+- **Object Versioning** — Enable or suspend versioning per bucket (S3 semantics: once enabled it can only be suspended) with full delete marker support
+- **Lifecycle Rules** — Expiration by age and prefix, noncurrent-version expiration, incomplete-multipart cleanup and delete-marker cleanup, with `Filter`/`Status` honored
 - **Webhook Notifications** — Real-time HTTP callbacks for object events with HMAC signing
 - **Bucket Quotas** — Per-bucket storage limits to prevent disk exhaustion
 - **Custom Storage Directories** — Per-bucket storage paths for multi-disk setups (SSD for hot data, HDD for archives)
@@ -37,10 +38,13 @@ All metadata is stored in an embedded SQLite database.
 - **Image Optimization on Upload** — Automatically generate a smaller optimized variant alongside each uploaded image (small images inline, large ones in the background); the original is preserved
 - **WebDAV Mounting** — Mount a bucket as a network drive over WebDAV (per-bucket opt-in, Basic Auth maps to bucket credentials)
 - **Admin REST API** — Full management API with session-based authentication for GUI/automation
-- **CORS Support** — Browser-based S3 clients work out of the box
-- **TLS Support** — Optional HTTPS with certificate configuration
+- **CORS Support** — Browser-based S3 clients work once you list their origins in `server.cors_origins`
+- **TLS Support** — Optional HTTPS for the S3 API, the Admin API and WebDAV (each listener can carry its own certificate)
+- **Virtual-Host Addressing** — Optional `<bucket>.<domain>` style requests via `server.virtual_host_domains`
+- **Verified Uploads** — `Content-MD5`, `x-amz-content-sha256`, `x-amz-checksum-*` and `aws-chunked` chunk signatures are checked, so corrupt or tampered uploads are rejected
 - **Secure Storage** — Files stored with `.cloodsys3ext` extension, path traversal and symlink attack protection
-- **Cross-Platform** — Build targets for Linux, macOS, Windows, and Raspberry Pi
+- **Cross-Platform** — Build targets for Linux, macOS, Windows, and Raspberry Pi; Docker image included
+- **Safe Self-Update** — `cloodsys3 update` verifies release checksums before replacing the binary; the startup check can be switched off
 
 ## Quick Start
 
@@ -50,7 +54,7 @@ All metadata is stored in an embedded SQLite database.
 make build
 ```
 
-The binary is created in `build/`. No config file needed — it runs with sensible defaults.
+The binary is created in `build/`. No config file needed — it runs with sensible defaults (data under `./.cloodsys3/` in the current directory). Prefer a release binary? See [Install](#install).
 
 ### 2. Create a Bucket and Credentials
 
@@ -122,9 +126,10 @@ All CLI commands work while the server is running. SQLite WAL mode allows concur
 ./cloodsys3 bucket create <name> --storage-dir=/mnt/ssd   # Create with custom storage
 ./cloodsys3 bucket list                                   # List all buckets
 ./cloodsys3 bucket info <name>                            # Show details
-./cloodsys3 bucket delete <name>                          # Delete (must be empty)
+./cloodsys3 bucket delete <name>                          # Delete (refuses if any object/version/marker exists)
+./cloodsys3 bucket delete <name> --force                  # Delete together with all objects, versions and cached variants
 ./cloodsys3 bucket quota <name> 10GB                      # Set storage limit (KB/MB/GB/TB, 0=unlimited)
-./cloodsys3 bucket storage <name> --dir=/new/path         # Move storage to new location
+./cloodsys3 bucket storage <name> --dir=/new/path         # Move storage to new location (same filesystem)
 ./cloodsys3 bucket storage <name> --dir=                  # Reset to default storage
 ./cloodsys3 bucket public-read enable <name>              # Allow anonymous object reads (GET/HEAD)
 ./cloodsys3 bucket public-read disable <name>             # Disable anonymous reads (default)
@@ -172,7 +177,9 @@ Automatically expire objects after a specified number of days.
 ./cloodsys3 bucket lifecycle delete <name> --prefix=logs/          # Delete specific rule
 ```
 
-The background cleaner runs at a configurable interval (default `1h`) and removes expired objects in batches of 100.
+The background cleaner runs at a configurable interval (default `1h`) and removes expired objects in batches of 100. `lifecycle get` shows every rule with its status and actions.
+
+Rules written through the S3 API (`PutBucketLifecycle`) support the full set: `<Filter>` (prefix), `<Status>` (`Enabled`/`Disabled`), `<Expiration>`, `<NoncurrentVersionExpiration>`, `<AbortIncompleteMultipartUpload>` and `<ExpiredObjectDeleteMarker>`. Prefix matching is case-sensitive.
 
 ### Custom Storage Directories
 
@@ -195,8 +202,10 @@ By default all buckets store data under the global `root_dir`. You can assign a 
 
 Notes:
 - `--storage-dir` / `--dir` must be an absolute path
-- Deleting a bucket removes its storage directory regardless of location
-- Server restart required after CLI-based storage changes while server is running
+- `bucket storage` moves the data directory **and** the sibling `.<bucket>-multipart/` and `.<bucket>-cache/` trees with a rename, so source and target must be on the same filesystem. Cross-filesystem moves are refused; the command prints the `cp -a` steps to do it by hand.
+- Deleting a bucket removes all three trees regardless of location
+- **A running server caches storage locations.** After `bucket create --storage-dir` or `bucket storage` from the CLI, restart the server (or make the change through the admin API instead) — the CLI prints a reminder.
+- **systemd:** the shipped unit uses `ProtectSystem=strict`, so every custom storage directory must be added to `ReadWritePaths=` in a drop-in (`sudo systemctl edit cloodsys3`), otherwise writes to that bucket fail with permission errors. See [Running as a Service](#running-as-a-service-systemd).
 
 ### Image Resizing & Optimization
 
@@ -261,7 +270,14 @@ webdav:
   enabled: true       # master switch — runs the WebDAV server
   listen: ":9002"
   prefix: "/"
+  tls:
+    enabled: true     # strongly recommended: Basic auth carries the secret key on every request
+    cert_file: ""     # leave empty to reuse server.tls
+    key_file: ""
+  lock_timeout: "10m"
 ```
+
+WebDAV works on versioned buckets too: writes create new versions and deletes add delete markers, exactly like the S3 API. Windows refuses Basic auth over plain HTTP by default, so enable `webdav.tls` (or terminate TLS in a reverse proxy) for anything beyond localhost.
 
 ```bash
 ./cloodsys3 bucket webdav enable <name>    # opt the bucket in
@@ -292,25 +308,27 @@ Receive HTTP callbacks when objects are created or deleted.
 
 **Supported events:** `s3:ObjectCreated:Put`, `s3:ObjectCreated:Copy`, `s3:ObjectRemoved:Delete`, or `*` for all.
 
-When a secret is provided, requests include an `X-Cloodsy-Signature` HMAC-SHA256 header for payload verification. Events are delivered asynchronously with 3 retries and exponential backoff (1s, 2s, 4s). The payload follows the AWS S3 event notification format.
+When a secret is provided, requests include an `X-Cloodsy-Signature` HMAC-SHA256 header for payload verification. Passing `--secret` on the command line is visible in `ps` and shell history (the CLI warns); the secret is never printed back. Webhook URLs must be `http(s)` and are validated on creation. Events are delivered asynchronously with 3 retries and exponential backoff (1s, 2s, 4s). The payload follows the AWS S3 event notification format.
 
 ### Admin Management
 
 ```bash
-./cloodsys3 admin create <username>                     # Create with auto-generated password
-./cloodsys3 admin create <username> --password=mypass    # Create with custom password
+./cloodsys3 admin create <username>                     # Prompts for the password (no echo, asked twice)
+./cloodsys3 admin create <username> --generate          # Random 20-character password, printed once
+./cloodsys3 admin create <username> --password=mypass   # For scripts only (argv is visible in ps / history)
 ./cloodsys3 admin list                                  # List admin users
-./cloodsys3 admin delete <username>                     # Delete admin user
-./cloodsys3 admin password <username>                   # Reset with auto-generated password
-./cloodsys3 admin password <username> --password=new    # Reset with custom password
+./cloodsys3 admin delete <username>                     # Delete admin user (the last admin cannot be deleted)
+./cloodsys3 admin password <username>                   # Reset interactively
+./cloodsys3 admin password <username> --generate        # Reset with a generated password
+./cloodsys3 admin password <username> --password=new    # Reset from a script
 ```
 
-Admin users are used to authenticate with the Admin REST API. Passwords are stored as bcrypt hashes.
+Admin users are used to authenticate with the Admin REST API. Passwords must be 8–72 bytes and are stored as bcrypt hashes. A custom password is never echoed back; `--password` prints a one-line warning because command-line arguments are visible to other local users and land in shell history.
 
 ### Version Info
 
 ```bash
-./cloodsys3 version
+./cloodsys3 version     # first line: "Cloodsy S3 vX.Y.Z", then commit and build date
 ```
 
 ## S3 API Operations
@@ -328,16 +346,16 @@ Admin users are used to authenticate with the Admin REST API. Passwords are stor
 
 ### Bucket Operations
 
-| Operation | Method | Endpoint |
-|-----------|--------|----------|
-| ListBuckets | GET | `/` |
-| CreateBucket | PUT | `/<bucket>` |
-| DeleteBucket | DELETE | `/<bucket>` |
-| HeadBucket | HEAD | `/<bucket>` |
-| GetBucketLocation | GET | `/<bucket>?location` |
-| ListObjects | GET | `/<bucket>` |
-| ListObjectsV2 | GET | `/<bucket>?list-type=2` |
-| ListObjectVersions | GET | `/<bucket>?versions` |
+| Operation | Method | Endpoint | Notes |
+|-----------|--------|----------|-------|
+| ListBuckets | GET | `/` | |
+| CreateBucket | PUT | `/<bucket>` | Buckets are created with the CLI or the admin API. A PUT for the credential's own bucket returns `BucketAlreadyOwnedByYou` (so `aws s3 mb` and Terraform stay idempotent); any other name is denied |
+| DeleteBucket | DELETE | `/<bucket>` | |
+| HeadBucket | HEAD | `/<bucket>` | |
+| GetBucketLocation | GET | `/<bucket>?location` | |
+| ListObjects | GET | `/<bucket>` | |
+| ListObjectsV2 | GET | `/<bucket>?list-type=2` | |
+| ListObjectVersions | GET | `/<bucket>?versions` | |
 
 ### Versioning & Lifecycle
 
@@ -391,6 +409,20 @@ These operations are accepted for compatibility with tools like Terraform, s3cmd
 | PutBucketPolicy | PUT | `/<bucket>?policy` | Accepted, ignored |
 | DeleteBucketPolicy | DELETE | `/<bucket>?policy` | No-op |
 
+Unknown sub-resources (for example `?cors`, `?website`, `?replication`) return `NotImplemented` and never fall through to the plain bucket/object handlers.
+
+### S3 Compatibility Notes
+
+- **Multipart ETag** is S3-style: `"<md5-of-concatenated-part-md5s>-<partCount>"`. Clients that compare ETags (rclone, s3cmd, the AWS SDK checksum validators) behave as they do against AWS.
+- **Minimum part size** is 5 MiB for every part except the last (`EntityTooSmall` otherwise), matching AWS.
+- **Integrity headers are verified**: `Content-MD5`, `x-amz-content-sha256` (real digests, `UNSIGNED-PAYLOAD`, and `STREAMING-AWS4-HMAC-SHA256-PAYLOAD` with per-chunk signatures), and `x-amz-checksum-crc32/crc32c/sha1/sha256`. A mismatch is rejected with `BadDigest` / `XAmzContentSHA256Mismatch` / `SignatureDoesNotMatch`. Set `server.require_payload_signature: true` to refuse `UNSIGNED-PAYLOAD` on header-authenticated requests.
+- **`encoding-type=url`** is supported on all list operations.
+- **`response-*` query overrides** (`response-content-type`, `response-content-disposition`, `response-cache-control`, …) are honored on `GetObject`, including presigned URLs. Objects are otherwise served with the stored `Content-Type` and no forced `Content-Disposition`.
+- **Lifecycle** supports `Filter`, `Status`, `Expiration`, `NoncurrentVersionExpiration`, `AbortIncompleteMultipartUpload` and `ExpiredObjectDeleteMarker`.
+- **Versioning** can be `Enabled` or `Suspended`; there is no way back to the unversioned state, exactly like AWS.
+- **CreateBucket via the S3 API is denied**: credentials are bound to one existing bucket, so a PUT for that bucket answers `BucketAlreadyOwnedByYou` and any other name is refused. Create buckets with `cloodsys3 bucket create` or the admin API.
+- **Virtual-hosted-style** requests work when the domain is listed in `server.virtual_host_domains`; path-style is always available.
+
 ## Authentication
 
 Cloodsy S3 uses AWS Signature Version 4 (SigV4) for authentication, supporting both header-based signing and presigned URLs.
@@ -399,7 +431,8 @@ Cloodsy S3 uses AWS Signature Version 4 (SigV4) for authentication, supporting b
 - `ListBuckets` only returns the bucket associated with the credential in use
 - Multiple credentials can be created per bucket
 - Credentials support `read-write` or `read-only` permissions
-- Chunked upload signing (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) is supported
+- Chunked upload signing (`STREAMING-AWS4-HMAC-SHA256-PAYLOAD`) is supported and every chunk signature is verified; malformed or truncated chunk streams are rejected instead of being stored
+- Payload hashes (`x-amz-content-sha256`) are verified when the client sends a real digest
 - Time skew tolerance: 5 minutes
 
 ### Presigned URLs
@@ -428,9 +461,17 @@ The Admin API provides a JSON-based management interface on a separate port. Ena
 ```yaml
 admin:
   enabled: true
-  listen: ":9001"
-  cors_origins: ["*"]
+  listen: "127.0.0.1:9001"   # or enable admin.tls before exposing it
+  cors_origins: ["*"]        # only needed for browser clients such as the Flutter web GUI
+  tls:
+    enabled: false           # true = HTTPS; leave cert/key empty to reuse server.tls
+    cert_file: ""
+    key_file: ""
+  trusted_proxies: []        # e.g. ["127.0.0.1", "10.0.0.0/8"] when behind a reverse proxy
+  session_ttl: "8h"
 ```
+
+The admin API carries passwords and secret keys: bind it to localhost, enable `admin.tls`, or put a TLS reverse proxy in front. The server logs a warning at start-up when the admin listener is reachable without TLS on a non-loopback address. Login attempts are rate limited per client IP; `X-Forwarded-For` is only trusted from the addresses in `admin.trusted_proxies`.
 
 ### Authentication
 
@@ -443,14 +484,14 @@ curl -X POST http://localhost:9001/admin/login \
   -H "Content-Type: application/json" \
   -d '{"username":"myadmin","password":"<password>"}'
 
-# Response: {"token":"cks_...","expires_in":86400}
+# Response: {"token":"cks_...","expires_in":28800}
 
 # Use token for all subsequent requests
 curl http://localhost:9001/admin/buckets \
   -H "Authorization: Bearer cks_..."
 ```
 
-Sessions expire after 24 hours. Tokens are stored in-memory and cleared on server restart.
+Sessions expire after 8 hours by default (`admin.session_ttl`). Tokens are stored in-memory and cleared on server restart.
 
 ### Endpoints
 
@@ -488,7 +529,7 @@ Sessions expire after 24 hours. Tokens are stored in-memory and cleared on serve
 
 ## Configuration
 
-Configuration is optional. The server runs with sensible defaults. To customize, pass a YAML file:
+Configuration is optional. The server runs with sensible defaults. To customize, pass a YAML file (or set `CLOODSYS3_CONFIG`). Unknown keys are rejected and every value is validated at start-up, so typos fail fast. [`config.yaml.example`](config.yaml.example) documents every key.
 
 ```bash
 ./cloodsys3 serve -config config.yaml
@@ -502,6 +543,11 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+  cors_origins: []                  # browser origins allowed on the S3 API (empty = no CORS headers)
+  virtual_host_domains: []          # ["s3.example.com"] enables <bucket>.s3.example.com addressing
+  max_connections: 0                # 0 = unlimited
+  idle_timeout: "60s"               # per-request stall timeout; large transfers are not capped
+  require_payload_signature: false  # reject UNSIGNED-PAYLOAD header-auth requests
 
 database:
   path: "./.cloodsys3/cloodsys3.db"
@@ -522,8 +568,13 @@ logging:
 admin:
   enabled: false              # Enable Admin REST API
   listen: ":9001"             # Admin API port (separate from S3)
-  cors_origins:               # Allowed origins for CORS
-    - "*"
+  cors_origins: []            # Allowed origins for browser clients
+  tls:                        # Per-listener TLS (empty cert/key = reuse server.tls)
+    enabled: false
+    cert_file: ""
+    key_file: ""
+  trusted_proxies: []         # IPs/CIDRs whose X-Forwarded-For is honored
+  session_ttl: "8h"           # Admin session lifetime
 
 image:
   enabled: false              # Auto image optimization on upload (original preserved)
@@ -531,12 +582,41 @@ image:
   quality: 75                 # JPEG quality (1-100)
   workers: 2                  # Async optimization workers
   queue_size: 256             # Async queue buffer size
+  max_source_bytes: 33554432  # Never decode images larger than 32 MB
+  max_concurrent: 4           # Simultaneous decodes (transforms + optimizer)
+  cache_max_bytes: 1073741824 # Per-bucket variant cache bound (1 GB, 0 = unlimited)
+  dimension_step: 16          # Round requested sizes up to a multiple of 16
 
 webdav:
   enabled: false              # Run the WebDAV server (master switch)
   listen: ":9002"             # WebDAV port (separate from S3 and Admin)
   prefix: "/"                 # URL path prefix; buckets are opt-in (default OFF)
+  tls:                        # Per-listener TLS (empty cert/key = reuse server.tls)
+    enabled: false
+    cert_file: ""
+    key_file: ""
+  lock_timeout: "10m"         # Maximum WebDAV lock lifetime
+
+update:
+  check_on_start: true        # Set false to never contact GitHub at start-up
 ```
+
+### Environment Variables
+
+The most common settings can be overridden without a config file — useful under systemd (`EnvironmentFile=/etc/cloodsys3/env`) and in containers. Environment values take precedence over the YAML file.
+
+| Variable | Config key |
+|----------|------------|
+| `CLOODSYS3_CONFIG` | path of the config file (same as `-config`) |
+| `CLOODSYS3_LISTEN` | `server.listen` |
+| `CLOODSYS3_REGION` | `server.region` |
+| `CLOODSYS3_TLS_ENABLED` / `CLOODSYS3_TLS_CERT` / `CLOODSYS3_TLS_KEY` | `server.tls.*` |
+| `CLOODSYS3_DB_PATH` | `database.path` |
+| `CLOODSYS3_DATA_DIR` | `storage.root_dir` |
+| `CLOODSYS3_LOG_LEVEL` / `CLOODSYS3_LOG_FORMAT` | `logging.*` |
+| `CLOODSYS3_ADMIN_ENABLED` / `CLOODSYS3_ADMIN_LISTEN` | `admin.enabled` / `admin.listen` |
+| `CLOODSYS3_WEBDAV_ENABLED` / `CLOODSYS3_WEBDAV_LISTEN` | `webdav.enabled` / `webdav.listen` |
+| `CLOODSYS3_UPDATE_CHECK` | `update.check_on_start` |
 
 ## Install
 
@@ -546,7 +626,11 @@ webdav:
 curl -fsSL https://raw.githubusercontent.com/onaonbir/Cloodsy-S3/main/install.sh | bash
 ```
 
-Detects your OS and architecture automatically, downloads the latest release, and installs to `/usr/local/bin/`.
+Detects your OS and architecture automatically, downloads the latest release, verifies its SHA-256 against the release's `checksums.txt`, and installs to `/usr/local/bin/`. The script is safe to re-run (it skips when the same version is already installed) and accepts a pinned version:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/onaonbir/Cloodsy-S3/main/install.sh | bash -s -- --version v1.2.0
+```
 
 ### Manual Download
 
@@ -561,6 +645,30 @@ Download from [GitHub Releases](https://github.com/onaonbir/Cloodsy-S3/releases/
 | macOS Apple Silicon | `cloodsys3-darwin-arm64.tar.gz` |
 | macOS Intel | `cloodsys3-darwin-amd64.tar.gz` |
 
+Every archive contains the `cloodsys3` binary (`cloodsys3.exe` on Windows), `LICENSE` and `THIRD_PARTY_LICENSES.md`. Verify a manual download with `sha256sum -c checksums.txt`.
+
+### Docker
+
+A multi-stage `Dockerfile` builds the static binary and ships it on a distroless, non-root image. All state lives under the `/data` volume.
+
+```bash
+docker build -t cloodsys3 .
+docker run -d --name cloodsys3 -p 9000:9000 -v cloodsys3-data:/data cloodsys3
+
+# Manage buckets/credentials with the same binary inside the container
+docker exec cloodsys3 /cloodsys3 bucket create my-bucket
+docker exec cloodsys3 /cloodsys3 credential create my-bucket
+docker exec -it cloodsys3 /cloodsys3 admin create admin --generate
+```
+
+Or with Compose (`docker-compose.yml` publishes the S3 port, keeps the admin API on localhost and enables JSON logs):
+
+```bash
+docker compose up -d
+docker compose exec cloodsys3 /cloodsys3 bucket create my-bucket
+```
+
+The image sets `CLOODSYS3_DB_PATH=/data/cloodsys3.db`, `CLOODSYS3_DATA_DIR=/data/data` and `CLOODSYS3_UPDATE_CHECK=false`; every other setting comes from the environment variables above or a mounted config file (`CLOODSYS3_CONFIG=/config/config.yaml`). Custom `--storage-dir` paths must be mounted into the container as well.
 ## Update
 
 ```bash
@@ -571,9 +679,16 @@ Download from [GitHub Releases](https://github.com/onaonbir/Cloodsy-S3/releases/
 ./cloodsys3 update
 ```
 
-The `update` command downloads the latest release from GitHub and replaces the current binary. Restart the server after updating.
+The `update` command downloads the latest release from GitHub, verifies the archive's SHA-256 against the release's `checksums.txt`, extracts the `cloodsys3` binary and swaps it in atomically (the previous binary is restored if anything fails). It refuses to install anything without a matching checksum. On Windows the running `.exe` is renamed to `.old` and can be deleted after the restart. Restart the server after updating.
 
-The server also checks for updates on startup and logs a warning if a newer version is available.
+Dev builds (`make build` without a release version) never self-update. Use `install.sh` or a release archive instead.
+
+The server also checks for updates once on startup and logs a warning if a newer version is available. Opt out for air-gapped or privacy-sensitive deployments:
+
+```yaml
+update:
+  check_on_start: false     # or CLOODSYS3_UPDATE_CHECK=false
+```
 
 ## Deployment
 
@@ -610,9 +725,13 @@ Runtime directory structure:
 
 # Buckets with --storage-dir use custom locations:
 /mnt/ssd/
-└── hot-bucket/
-    └── data.bin.cloodsys3ext
+├── hot-bucket/
+│   └── data.bin.cloodsys3ext
+├── .hot-bucket-multipart/     # in-progress multipart parts
+└── .hot-bucket-cache/         # resized / optimized image variants
 ```
+
+**On-disk key encoding.** Keys map to paths one-to-one; keys that would collide or are unsafe as file names (a trailing `/` such as `dir/`, `//`, `.`/`..` segments, characters reserved on Windows, control characters) are stored percent-encoded on disk. Nothing changes for normal keys. Existing deployments are migrated automatically once on the first `serve` after upgrading; the migration is idempotent and safe to interrupt. Always use the S3 API or the CLI to move data — never rename files under the data directory by hand.
 
 ### Windows
 
@@ -649,7 +768,25 @@ sudo systemctl status cloodsys3
 sudo journalctl -u cloodsys3 -f
 ```
 
-The service automatically restarts on failure with a 5-second delay.
+The service automatically restarts on failure with a 5-second delay, waits for `network-online.target`, and runs sandboxed (`ProtectSystem=strict`, `PrivateTmp`, `PrivateDevices`, kernel/cgroup protection, restricted address families and syscall architectures, `UMask=0077`). Optional environment overrides go into `/etc/cloodsys3/env` (`EnvironmentFile=`), for example `CLOODSYS3_LOG_FORMAT=json`.
+
+**Custom storage directories and `ReadWritePaths`.** `ProtectSystem=strict` makes the whole filesystem read-only for the service except `ReadWritePaths=/opt/cloodsys3`. Every bucket created with `--storage-dir` (or moved with `bucket storage --dir`) lives outside that path and must be added in a drop-in, otherwise all writes to that bucket fail with permission errors:
+
+```bash
+sudo systemctl edit cloodsys3
+```
+
+```ini
+[Service]
+ReadWritePaths=/mnt/ssd
+ReadWritePaths=/mnt/hdd
+```
+
+```bash
+sudo systemctl daemon-reload && sudo systemctl restart cloodsys3
+```
+
+Run CLI commands as the service user (`sudo -u cloodsys3 /opt/cloodsys3/cloodsys3 bucket create ...`) so the database and data directories keep the right ownership. Stopping or restarting the service sends `SIGTERM`; the server drains in-flight requests (up to `TimeoutStopSec=30`) before exiting.
 
 ### Secure Storage
 
@@ -657,17 +794,23 @@ Uploaded files are stored on disk with a `.cloodsys3ext` extension to prevent ac
 
 - **Path traversal protection** — All paths validated against base directory escape
 - **Symlink attack prevention** — Files opened with `O_NOFOLLOW` flag
-- **Atomic writes** — Temp file + rename pattern prevents partial reads
+- **Atomic writes** — Temp file + `fsync` + rename; a failed upload never touches the existing object
+- **Collision-free layout** — Keys that cannot be represented safely as file names are percent-encoded on disk (see [Deployment](#deployment))
 - **Security headers** — `X-Content-Type-Options: nosniff`, `X-Frame-Options: DENY`
 
 ## Security
 
-- **S3 API** runs on its own port (default `:9000`) — exposed to S3 clients
-- **Admin API** runs on a separate port (default `:9001`) — restrict via firewall to trusted networks
+- **S3 API** runs on its own port (default `:9000`) — exposed to S3 clients; enable `server.tls` or terminate TLS in a reverse proxy
+- **Admin API** runs on a separate port (default `:9001`) — bind to localhost, enable `admin.tls`, or restrict via firewall; the server warns when it is reachable in cleartext
+- **WebDAV** (default `:9002`, opt-in) — Basic auth carries the secret key on every request; enable `webdav.tls`
 - **Credentials** — Per-bucket scoped, supports read-only permission
-- **Admin passwords** — Stored as bcrypt hashes, never in plain text
-- **Session tokens** — 24-hour TTL, in-memory only, cleared on restart
-- **CORS** — Configurable allowed origins for browser-based access
+- **Admin passwords** — Stored as bcrypt hashes, never in plain text; create them interactively or with `--generate` so they never land in shell history
+- **Session tokens** — 8-hour TTL by default (`admin.session_ttl`), in-memory only, cleared on restart
+- **Login rate limiting** — Per client IP; `X-Forwarded-For` is only honored from `admin.trusted_proxies`
+- **Upload integrity** — `Content-MD5`, `x-amz-content-sha256`, `x-amz-checksum-*` and aws-chunked chunk signatures are verified; `server.require_payload_signature` rejects unsigned payloads
+- **CORS** — Off unless origins are listed in `server.cors_origins` / `admin.cors_origins`
+- **Self-update** — Release archives are verified against `checksums.txt` before installation; disable the start-up check with `update.check_on_start: false`
+- **Reporting** — See [SECURITY.md](SECURITY.md) for the disclosure policy and supported versions
 
 ## SDK Examples
 
@@ -751,9 +894,17 @@ make build-mac-intel  # macOS Intel (x86_64)
 make build-pi         # Raspberry Pi 3/4/5 (ARM64)
 make build-armv7      # Raspberry Pi 2 / older ARM (ARMv7)
 make build-all        # Linux (amd64 + arm64 + armv7)
-make clean            # Remove build directory
+make run              # Build and start `serve` with data under ./.cloodsys3 (gitignored)
+make test             # go test ./...
+make vet              # go vet ./...
+make lint             # staticcheck ./... (when installed)
+make vuln             # govulncheck ./...
+make check            # vet + lint + test + vuln (same as CI)
+make clean            # Remove the build directory only (runtime data is never touched)
 make version          # Print current version
 ```
+
+All builds are static (`CGO_ENABLED=0`), reproducible (`-trimpath`) and stripped (`-ldflags "-s -w"`) with the version, commit and build date injected. Releases are cut with `./release.sh <version>` and built by GitHub Actions; see [CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## License
 

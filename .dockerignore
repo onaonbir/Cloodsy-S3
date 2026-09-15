@@ -1,0 +1,29 @@
+# Build output and runtime data
+build/
+build_test/
+.cloodsys3/
+dist/
+bin/
+
+# VCS, IDE, tooling
+.git/
+.github/
+.idea/
+.claude/
+.vscode/
+claude_img/
+
+# Docs and scripts that are not part of the binary
+*.md
+!THIRD_PARTY_LICENSES.md
+install.sh
+release.sh
+cloodsys3.service
+docker-compose.yml
+Dockerfile
+.dockerignore
+
+# Tests and local config
+*_test.go
+config.yaml
+*.env

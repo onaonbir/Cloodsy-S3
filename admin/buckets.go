@@ -1,13 +1,15 @@
 package admin
 
 import (
-	"encoding/json"
+	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"regexp"
 	"strconv"
 
+	"github.com/onaonbir/Cloodsy-S3/httpx"
 	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 )
 
@@ -96,13 +98,32 @@ func (h *Handler) handleGetBucket(w http.ResponseWriter, r *http.Request, name s
 	})
 }
 
+// validateStorageDir checks a custom storage base directory supplied by the
+// admin. It must be absolute and clean (no ".." tricks, no NUL).
+func validateStorageDir(dir string) string {
+	if dir == "" {
+		return ""
+	}
+	if !filepath.IsAbs(dir) {
+		return "storage_dir must be an absolute path"
+	}
+	if filepath.Clean(dir) != dir {
+		return "storage_dir must be a clean absolute path"
+	}
+	for _, c := range dir {
+		if c == 0 {
+			return "storage_dir contains NUL"
+		}
+	}
+	return ""
+}
+
 func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 	var req struct {
 		Name       string `json:"name"`
 		StorageDir string `json:"storage_dir"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
@@ -111,8 +132,8 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if req.StorageDir != "" && !filepath.IsAbs(req.StorageDir) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "storage_dir must be an absolute path"})
+	if msg := validateStorageDir(req.StorageDir); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 
@@ -144,11 +165,14 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 	if err := os.MkdirAll(storagePath, 0700); err != nil {
 		h.Logger.Error("create storage dir error", "error", err)
 		h.DB.DeleteBucket(req.Name)
+		if req.StorageDir != "" {
+			h.Storage.RemoveBucketDir(req.Name)
+		}
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create storage directory"})
 		return
 	}
 
-	h.Logger.Info("bucket created via admin API", "bucket", req.Name, "storage_dir", req.StorageDir)
+	h.Logger.Info("bucket created via admin API", "bucket", req.Name, "storage_dir", httpx.SanitizeLog(req.StorageDir))
 	writeJSON(w, http.StatusCreated, map[string]interface{}{
 		"id":          bucket.ID,
 		"name":        bucket.Name,
@@ -157,6 +181,10 @@ func (h *Handler) handleCreateBucket(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// handleDeleteBucket removes a bucket. It refuses while any object row exists
+// (current objects, non-current versions or delete markers) unless
+// ?force=true is given, in which case the rows are dropped with the bucket
+// (ON DELETE CASCADE) and the data directories are removed.
 func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, name string) {
 	bucket, err := h.DB.GetBucket(name)
 	if err != nil {
@@ -169,14 +197,27 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, nam
 		return
 	}
 
-	hasObjects, err := h.DB.BucketHasObjects(bucket.ID)
+	force, _ := strconv.ParseBool(r.URL.Query().Get("force"))
+
+	if ok, op := h.tryLockBucket(name, "delete"); !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is busy: " + op + " in progress"})
+		return
+	}
+	defer h.unlockBucket(name)
+
+	hasRows, err := h.DB.BucketHasAnyRows(bucket.ID)
 	if err != nil {
 		h.Logger.Error("check objects error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
-	if hasObjects {
-		writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is not empty"})
+	if hasRows && !force {
+		hasObjects, _ := h.DB.BucketHasObjects(bucket.ID)
+		msg := "bucket is not empty"
+		if !hasObjects {
+			msg = "bucket still holds object versions or delete markers; pass ?force=true to delete them"
+		}
+		writeJSON(w, http.StatusConflict, map[string]string{"error": msg})
 		return
 	}
 
@@ -186,12 +227,12 @@ func (h *Handler) handleDeleteBucket(w http.ResponseWriter, r *http.Request, nam
 		return
 	}
 
-	// Delete storage directory
+	// Delete storage directory (and the sibling multipart/cache trees).
 	if err := h.Storage.DeleteBucketDir(name); err != nil {
 		h.Logger.Error("delete bucket dir error", "bucket", name, "error", err)
 	}
 
-	h.Logger.Info("bucket deleted via admin API", "bucket", name)
+	h.Logger.Info("bucket deleted via admin API", "bucket", name, "force", force, "had_rows", hasRows)
 	writeJSON(w, http.StatusOK, map[string]string{"message": "bucket deleted"})
 }
 
@@ -205,8 +246,11 @@ func (h *Handler) handleSetQuota(w http.ResponseWriter, r *http.Request, name st
 	var req struct {
 		QuotaBytes int64 `json:"quota_bytes"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
+		return
+	}
+	if req.QuotaBytes < 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "quota_bytes must be >= 0"})
 		return
 	}
 
@@ -222,6 +266,63 @@ func (h *Handler) handleSetQuota(w http.ResponseWriter, r *http.Request, name st
 	})
 }
 
+// movedEntry records one rename so a failed move can be undone.
+type movedEntry struct {
+	src, dst string
+}
+
+// moveTree renames every entry of src into dst (creating dst). It appends the
+// renames to *moved so the caller can roll back. A missing src is not an error.
+func moveTree(src, dst string, moved *[]movedEntry, created *[]string) (int, error) {
+	entries, err := os.ReadDir(src)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return 0, nil
+		}
+		return 0, fmt.Errorf("read %s: %w", src, err)
+	}
+	if len(entries) == 0 {
+		return 0, nil
+	}
+	if _, err := os.Stat(dst); os.IsNotExist(err) {
+		if err := os.MkdirAll(dst, 0700); err != nil {
+			return 0, fmt.Errorf("create %s: %w", dst, err)
+		}
+		*created = append(*created, dst)
+	}
+	n := 0
+	for _, e := range entries {
+		s := filepath.Join(src, e.Name())
+		d := filepath.Join(dst, e.Name())
+		if _, err := os.Lstat(d); err == nil {
+			return n, fmt.Errorf("destination already has %s", e.Name())
+		}
+		if err := os.Rename(s, d); err != nil {
+			return n, fmt.Errorf("move %s: %w", e.Name(), err)
+		}
+		*moved = append(*moved, movedEntry{src: s, dst: d})
+		n++
+	}
+	return n, nil
+}
+
+// rollbackMoves renames entries back in reverse order and removes the
+// directories this move created. Errors are logged; there is nothing better
+// to do with them.
+func (h *Handler) rollbackMoves(moved []movedEntry, created []string) {
+	for i := len(moved) - 1; i >= 0; i-- {
+		if err := os.Rename(moved[i].dst, moved[i].src); err != nil {
+			h.Logger.Error("storage move rollback failed", "from", moved[i].dst, "to", moved[i].src, "error", err)
+		}
+	}
+	for i := len(created) - 1; i >= 0; i-- {
+		os.Remove(created[i]) // only succeeds when empty, which is the point
+	}
+}
+
+// handleSetStorage relocates a bucket's data (objects, multipart staging and
+// variant cache) to another base directory on the same filesystem and then
+// records the new location. Any failure mid-way moves everything back.
 func (h *Handler) handleSetStorage(w http.ResponseWriter, r *http.Request, name string) {
 	bucket, err := h.DB.GetBucket(name)
 	if err != nil || bucket == nil {
@@ -232,17 +333,16 @@ func (h *Handler) handleSetStorage(w http.ResponseWriter, r *http.Request, name 
 	var req struct {
 		StorageDir string `json:"storage_dir"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
-	if req.StorageDir != "" && !filepath.IsAbs(req.StorageDir) {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "storage_dir must be an absolute path"})
+	if msg := validateStorageDir(req.StorageDir); msg != "" {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg})
 		return
 	}
 
-	// Determine old and new paths
+	// Determine old and new base paths
 	oldBase := h.Config.Storage.RootDir
 	if bucket.StorageDir != "" {
 		oldBase = bucket.StorageDir
@@ -251,6 +351,8 @@ func (h *Handler) handleSetStorage(w http.ResponseWriter, r *http.Request, name 
 	if req.StorageDir != "" {
 		newBase = req.StorageDir
 	}
+	oldBase, _ = filepath.Abs(oldBase)
+	newBase, _ = filepath.Abs(newBase)
 
 	oldPath := filepath.Join(oldBase, name)
 	newPath := filepath.Join(newBase, name)
@@ -265,37 +367,70 @@ func (h *Handler) handleSetStorage(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 
-	// Create new dir
-	if err := os.MkdirAll(newPath, 0700); err != nil {
+	// One long-running operation per bucket at a time.
+	if ok, op := h.tryLockBucket(name, "storage move"); !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is busy: " + op + " in progress"})
+		return
+	}
+	defer h.unlockBucket(name)
+
+	// The new base must exist and live on the same device: os.Rename cannot
+	// cross filesystems and a copy would leave two half-states around.
+	if err := os.MkdirAll(newBase, 0700); err != nil {
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create new storage directory"})
 		return
 	}
-
-	// Move files
-	entries, err := os.ReadDir(oldPath)
-	if err != nil && !os.IsNotExist(err) {
-		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to read old storage directory"})
+	if err := os.MkdirAll(oldPath, 0700); err != nil { // ensure the source exists for the device probe
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to access current storage directory"})
+		return
+	}
+	same, err := sameDevice(oldPath, newBase)
+	if err != nil {
+		h.Logger.Error("storage move device check failed", "bucket", name, "error", err)
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to compare storage devices"})
+		return
+	}
+	if !same {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": "new storage_dir is on a different filesystem; cross-device moves are not supported (copy the data offline and update storage_dir afterwards)",
+		})
 		return
 	}
 
+	// Move the object tree plus the sibling staging/cache trees.
+	pairs := []movedEntry{
+		{src: oldPath, dst: newPath},
+		{src: filepath.Join(oldBase, "."+name+"-multipart"), dst: filepath.Join(newBase, "."+name+"-multipart")},
+		{src: filepath.Join(oldBase, "."+name+"-cache"), dst: filepath.Join(newBase, "."+name+"-cache")},
+	}
+	var moved []movedEntry
+	var created []string
 	movedCount := 0
-	for _, entry := range entries {
-		src := filepath.Join(oldPath, entry.Name())
-		dst := filepath.Join(newPath, entry.Name())
-		if err := os.Rename(src, dst); err != nil {
+	if _, err := os.Stat(newPath); os.IsNotExist(err) {
+		if err := os.MkdirAll(newPath, 0700); err != nil {
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "failed to create new storage directory"})
+			return
+		}
+		created = append(created, newPath)
+	}
+	for _, p := range pairs {
+		n, err := moveTree(p.src, p.dst, &moved, &created)
+		movedCount += n
+		if err != nil {
+			h.Logger.Error("bucket storage move failed, rolling back", "bucket", name, "error", err, "moved", movedCount)
+			h.rollbackMoves(moved, created)
 			writeJSON(w, http.StatusInternalServerError, map[string]string{
-				"error": "move failed at " + entry.Name() + ": " + err.Error(),
-				"moved": strconv.Itoa(movedCount),
+				"error": "move failed: " + err.Error(),
+				"moved": "0",
 			})
 			return
 		}
-		movedCount++
 	}
-	os.RemoveAll(oldPath)
 
-	// Update DB and in-memory registry
+	// Persist only after every byte is in place.
 	if err := h.DB.SetBucketStorageDir(name, req.StorageDir); err != nil {
-		h.Logger.Error("set storage dir error", "error", err)
+		h.Logger.Error("set storage dir error, rolling back move", "bucket", name, "error", err)
+		h.rollbackMoves(moved, created)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
 		return
 	}
@@ -306,7 +441,13 @@ func (h *Handler) handleSetStorage(w http.ResponseWriter, r *http.Request, name 
 		h.Storage.RemoveBucketDir(name)
 	}
 
-	h.Logger.Info("bucket storage moved via admin API", "bucket", name, "new_dir", req.StorageDir, "moved", movedCount)
+	// Old directories are empty now; remove them (never RemoveAll — anything
+	// that appeared concurrently is left alone).
+	for _, p := range pairs {
+		os.Remove(p.src)
+	}
+
+	h.Logger.Info("bucket storage moved via admin API", "bucket", name, "new_dir", httpx.SanitizeLog(req.StorageDir), "moved", movedCount)
 	writeJSON(w, http.StatusOK, map[string]interface{}{
 		"name":         name,
 		"storage_dir":  req.StorageDir,
@@ -343,8 +484,7 @@ func (h *Handler) handleSetVersioning(w http.ResponseWriter, r *http.Request, na
 	var req struct {
 		Versioning string `json:"versioning"` // "Enabled" or "Suspended"
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
@@ -375,8 +515,7 @@ func (h *Handler) handleSetPublicRead(w http.ResponseWriter, r *http.Request, na
 	var req struct {
 		PublicRead bool `json:"public_read"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
@@ -403,8 +542,7 @@ func (h *Handler) handleSetWebDAV(w http.ResponseWriter, r *http.Request, name s
 	var req struct {
 		WebDAVEnabled bool `json:"webdav_enabled"`
 	}
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+	if !decodeJSON(w, r, &req, false) {
 		return
 	}
 
@@ -423,7 +561,8 @@ func (h *Handler) handleSetWebDAV(w http.ResponseWriter, r *http.Request, name s
 
 // handleReprocess regenerates optimized image variants for a bucket's existing
 // objects. It runs in the background and returns immediately so the GUI stays
-// responsive. Originals are never modified.
+// responsive. Originals are never modified. Only one reprocess (or other
+// long-running operation) may run per bucket; a second request gets 409.
 func (h *Handler) handleReprocess(w http.ResponseWriter, r *http.Request, name string) {
 	bucket, err := h.DB.GetBucket(name)
 	if err != nil || bucket == nil {
@@ -435,10 +574,25 @@ func (h *Handler) handleReprocess(w http.ResponseWriter, r *http.Request, name s
 	if quality <= 0 || quality > 100 {
 		quality = 75
 	}
+	maxSource := h.Config.Image.MaxSourceBytes
+
+	if ok, op := h.tryLockBucket(name, "reprocess"); !ok {
+		writeJSON(w, http.StatusConflict, map[string]string{"error": "bucket is busy: " + op + " in progress"})
+		return
+	}
 
 	go func(bucketID int64) {
+		defer h.unlockBucket(name)
+		defer func() {
+			if rec := recover(); rec != nil {
+				h.Logger.Error("reprocess panic", "bucket", name, "panic", fmt.Sprint(rec))
+			}
+		}()
+		// Images are decoded one at a time here; the S3 GET transform path
+		// has its own limiter, so a reprocess adds at most one decode to the
+		// process-wide concurrency.
 		marker := ""
-		processed := 0
+		processed, failed := 0, 0
 		for {
 			objects, _, truncated, next, err := h.DB.ListObjectsMeta(bucketID, "", marker, "", 1000)
 			if err != nil {
@@ -450,23 +604,37 @@ func (h *Handler) handleReprocess(w http.ResponseWriter, r *http.Request, name s
 				if m.IsDeleteMarker || !imageutil.IsImageContentType(m.ContentType) {
 					continue
 				}
+				if maxSource > 0 && m.Size > maxSource {
+					continue
+				}
 				job := imageutil.Job{Bucket: name, Key: m.Key, VersionID: m.VersionID, ETag: m.ETag, ContentType: m.ContentType}
-				if err := imageutil.OptimizeOne(h.Storage, job, quality); err != nil {
-					h.Logger.Debug("reprocess optimize failed", "key", m.Key, "error", err)
+				if err := optimizeSafely(h.Storage, job, quality, maxSource); err != nil {
+					h.Logger.Debug("reprocess optimize failed", "key", httpx.SanitizeLog(m.Key), "error", err)
+					failed++
 					continue
 				}
 				processed++
 			}
-			if !truncated {
+			if !truncated || next == "" || next == marker {
 				break
 			}
 			marker = next
 		}
-		h.Logger.Info("reprocess complete", "bucket", name, "optimized", processed)
+		h.Logger.Info("reprocess complete", "bucket", name, "optimized", processed, "failed", failed)
 	}(bucket.ID)
 
 	writeJSON(w, http.StatusAccepted, map[string]interface{}{
 		"name":   name,
 		"status": "reprocessing started",
 	})
+}
+
+// optimizeSafely contains a decoder panic to the single job.
+func optimizeSafely(store imageutil.VariantStore, job imageutil.Job, quality int, maxSource int64) (err error) {
+	defer func() {
+		if rec := recover(); rec != nil {
+			err = errors.New(fmt.Sprint("decoder panic: ", rec))
+		}
+	}()
+	return imageutil.OptimizeOne(store, job, quality, maxSource)
 }
