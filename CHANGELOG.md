@@ -6,6 +6,10 @@ All notable changes to Cloodsy S3 are documented here. The format follows
 
 ## [Unreleased]
 
+Nothing yet.
+
+## [1.3.0] - 2026-10-11
+
 ### Added
 
 - **Automatic TLS certificates via ACME (Let's Encrypt)**: `server.tls.acme`
@@ -137,6 +141,7 @@ All notable changes to Cloodsy S3 are documented here. The format follows
 
 See the [GitHub releases](https://github.com/onaonbir/Cloodsy-S3/releases).
 
-[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.2.0...HEAD
+[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.3.0...HEAD
+[1.3.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/onaonbir/Cloodsy-S3/releases/tag/v1.1.2
