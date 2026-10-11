@@ -8,7 +8,7 @@ Ships as a single static binary with zero dependencies — no CGO (pure-Go SQLit
 All metadata is stored in an embedded SQLite database.
 
 [![Built by OnaOnbir](https://img.shields.io/badge/Built%20by-OnaOnbir-blue?style=flat-square)](https://onaonbir.com)
-[![Go](https://img.shields.io/badge/Go-1.25-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
+[![Go](https://img.shields.io/badge/Go-1.27-00ADD8?style=flat-square&logo=go&logoColor=white)](https://go.dev)
 [![CI](https://img.shields.io/github/actions/workflow/status/onaonbir/Cloodsy-S3/ci.yml?branch=main&style=flat-square&label=CI)](https://github.com/onaonbir/Cloodsy-S3/actions/workflows/ci.yml)
 [![Release](https://img.shields.io/github/v/release/onaonbir/Cloodsy-S3?style=flat-square)](https://github.com/onaonbir/Cloodsy-S3/releases/latest)
 

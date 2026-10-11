@@ -15,12 +15,12 @@ Regenerate this list after changing `go.mod` (`go list -m all`).
 | github.com/disintegration/imaging | v1.6.2 | MIT | image resizing / re-encoding |
 | github.com/google/uuid | v1.6.0 | BSD-3-Clause | upload and version identifiers |
 | github.com/pterm/pterm | v0.12.83 | MIT | CLI output |
-| golang.org/x/crypto | v0.55.0 | BSD-3-Clause | bcrypt (admin passwords) |
-| golang.org/x/image | v0.45.0 | BSD-3-Clause | WebP decoding |
-| golang.org/x/net | v0.58.0 | BSD-3-Clause | WebDAV server |
-| golang.org/x/term | v0.45.0 | BSD-3-Clause | no-echo password prompt |
+| golang.org/x/crypto | v0.58.0 | BSD-3-Clause | bcrypt (admin passwords) |
+| golang.org/x/image | v0.47.0 | BSD-3-Clause | WebP decoding |
+| golang.org/x/net | v0.61.0 | BSD-3-Clause | WebDAV server |
+| golang.org/x/term | v0.47.0 | BSD-3-Clause | no-echo password prompt |
 | gopkg.in/yaml.v3 | v3.0.1 | MIT (parts Apache-2.0, derived from libyaml) | configuration parsing |
-| modernc.org/sqlite | v1.46.1 | BSD-3-Clause | embedded SQLite (pure Go) |
+| modernc.org/sqlite | v1.60.1 | BSD-3-Clause | embedded SQLite (pure Go) |
 
 ## Indirect dependencies
 
@@ -34,17 +34,17 @@ Regenerate this list after changing `go.mod` (`go list -m all`).
 | github.com/dustin/go-humanize | v1.0.1 | MIT |
 | github.com/gookit/color | v1.6.0 | MIT |
 | github.com/lithammer/fuzzysearch | v1.1.8 | MIT |
-| github.com/mattn/go-isatty | v0.0.20 | MIT |
+| github.com/mattn/go-isatty | v0.0.24 | MIT |
 | github.com/mattn/go-runewidth | v0.0.20 | MIT |
 | github.com/ncruces/go-strftime | v1.0.0 | MIT |
 | github.com/remyoudompheng/bigfft | (pseudo-version) | BSD-3-Clause |
 | github.com/xo/terminfo | (pseudo-version) | MIT |
 | golang.org/x/exp | (pseudo-version) | BSD-3-Clause |
-| golang.org/x/sys | v0.47.0 | BSD-3-Clause |
-| golang.org/x/text | v0.41.0 | BSD-3-Clause |
-| modernc.org/libc | v1.67.6 | BSD-3-Clause |
+| golang.org/x/sys | v0.49.0 | BSD-3-Clause |
+| golang.org/x/text | v0.43.0 | BSD-3-Clause |
+| modernc.org/libc | v1.77.1 | BSD-3-Clause |
 | modernc.org/mathutil | v1.7.1 | BSD-3-Clause |
-| modernc.org/memory | v1.11.0 | BSD-3-Clause |
+| modernc.org/memory | v1.12.1 | BSD-3-Clause |
 
 ## Runtime images
 
