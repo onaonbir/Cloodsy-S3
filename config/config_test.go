@@ -312,3 +312,68 @@ func TestDuration(t *testing.T) {
 		t.Fatal("non-positive should fall back")
 	}
 }
+
+func TestACMEValidation(t *testing.T) {
+	base := func() *Config {
+		c := Default()
+		c.Server.TLS.Enabled = true
+		c.Server.TLS.ACME = ACMEConfig{Enabled: true, Domains: []string{"s3.example.com"}, AcceptTOS: true}
+		applyDefaults(c)
+		return c
+	}
+	if err := base().Validate(); err != nil {
+		t.Fatalf("valid acme config rejected: %v", err)
+	}
+	if c := base(); *c.Server.TLS.ACME.HTTPListen != ":80" {
+		t.Fatalf("http_listen default = %q", *c.Server.TLS.ACME.HTTPListen)
+	}
+	if c := base(); !strings.HasSuffix(c.Server.TLS.ACME.CacheDir, "acme") {
+		t.Fatalf("cache_dir default = %q", c.Server.TLS.ACME.CacheDir)
+	}
+	cases := []struct {
+		name string
+		mut  func(*Config)
+		want string
+	}{
+		{"tls disabled", func(c *Config) { c.Server.TLS.Enabled = false }, "requires server.tls.enabled"},
+		{"no domains", func(c *Config) { c.Server.TLS.ACME.Domains = nil }, "at least one hostname"},
+		{"wildcard", func(c *Config) { c.Server.TLS.ACME.Domains = []string{"*.example.com"} }, "not a valid hostname"},
+		{"ip", func(c *Config) { c.Server.TLS.ACME.Domains = []string{"10.0.0.1"} }, "not a valid hostname"},
+		{"no tos", func(c *Config) { c.Server.TLS.ACME.AcceptTOS = false }, "accept_tos"},
+		{"bad email", func(c *Config) { c.Server.TLS.ACME.Email = "nope" }, "email"},
+		{"bad http listen", func(c *Config) { s := "80"; c.Server.TLS.ACME.HTTPListen = &s }, "http_listen"},
+		{"http listen collides", func(c *Config) { s := c.Server.Listen; c.Server.TLS.ACME.HTTPListen = &s }, "must differ from server.listen"},
+		{"bad directory", func(c *Config) { c.Server.TLS.ACME.DirectoryURL = "http://ca" }, "directory_url"},
+	}
+	for _, tc := range cases {
+		c := base()
+		tc.mut(c)
+		err := c.Validate()
+		if err == nil || !strings.Contains(err.Error(), tc.want) {
+			t.Errorf("%s: got %v, want substring %q", tc.name, err, tc.want)
+		}
+	}
+	// Admin/WebDAV TLS without files is fine when ACME supplies the cert.
+	c := base()
+	c.Admin.Enabled, c.Admin.TLS.Enabled = true, true
+	c.WebDAV.Enabled, c.WebDAV.TLS.Enabled = true, true
+	if err := c.Validate(); err != nil {
+		t.Fatalf("admin/webdav tls via acme rejected: %v", err)
+	}
+}
+
+func TestACMEEnvOverrides(t *testing.T) {
+	t.Setenv("CLOODSYS3_TLS_ENABLED", "true")
+	t.Setenv("CLOODSYS3_ACME_ENABLED", "true")
+	t.Setenv("CLOODSYS3_ACME_DOMAINS", "a.example.com, b.example.com")
+	t.Setenv("CLOODSYS3_ACME_EMAIL", "ops@example.com")
+	t.Setenv("CLOODSYS3_ACME_ACCEPT_TOS", "true")
+	cfg, err := LoadDefault()
+	if err != nil {
+		t.Fatal(err)
+	}
+	a := cfg.Server.TLS.ACME
+	if !a.Enabled || len(a.Domains) != 2 || a.Domains[1] != "b.example.com" || a.Email != "ops@example.com" || !a.AcceptTOS {
+		t.Fatalf("env not applied: %+v", a)
+	}
+}

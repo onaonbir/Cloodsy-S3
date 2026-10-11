@@ -56,6 +56,17 @@ SystemCallArchitectures=native
 #
 # TLS certificates only need to be readable by the cloodsys3 user; they do
 # not have to be listed here.
+#
+# Automatic certificates (server.tls.acme): the HTTP-01 challenge listens on
+# port 80 and HTTPS is usually served on 443. Binding ports below 1024 as the
+# cloodsys3 user needs this capability; add it in the same drop-in:
+#
+#   [Service]
+#   AmbientCapabilities=CAP_NET_BIND_SERVICE
+#   CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+#
+# The ACME cache (default <database dir>/acme) lives under the data directory
+# and is already writable.
 ReadWritePaths=/opt/cloodsys3
 
 [Install]

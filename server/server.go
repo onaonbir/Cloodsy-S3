@@ -2,8 +2,10 @@ package server
 
 import (
 	"context"
+	"crypto/tls"
 	"errors"
 	"log/slog"
+	"net"
 	"net/http"
 	"os"
 	"os/signal"
@@ -28,6 +30,10 @@ var (
 	Version    = "dev"
 	CommitHash = "unknown"
 )
+
+// TLSConfig, when set by the caller, replaces the cert_file/key_file pair
+// (used for ACME-managed certificates).
+var TLSConfig *tls.Config
 
 // Run starts the S3 listener and background workers and blocks until the
 // process receives SIGINT/SIGTERM (or the optional parent ctx is cancelled).
@@ -85,8 +91,14 @@ func RunContext(parent context.Context, cfg *config.Config, h *handler.Handler, 
 	// On-access transforms (?w=&h=) are always available; keep their cache bounded.
 	go imageutil.RunCacheJanitor(ctx, h.DB, h.Storage, cfg.Image.CacheMaxBytes, logger)
 
-	certFile, keyFile := tlsFiles(cfg.Server.TLS)
-	ln, err := httpx.Listen(cfg.Server.Listen, certFile, keyFile, cfg.Server.MaxConnections)
+	var ln net.Listener
+	var err error
+	if TLSConfig != nil {
+		ln, err = httpx.ListenTLS(cfg.Server.Listen, TLSConfig, cfg.Server.MaxConnections)
+	} else {
+		certFile, keyFile := tlsFiles(cfg.Server.TLS)
+		ln, err = httpx.Listen(cfg.Server.Listen, certFile, keyFile, cfg.Server.MaxConnections)
+	}
 	if err != nil {
 		return err
 	}

@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -101,6 +102,35 @@ type TLSConfig struct {
 	Enabled  bool   `yaml:"enabled"`
 	CertFile string `yaml:"cert_file"`
 	KeyFile  string `yaml:"key_file"`
+	// ACME obtains and renews the certificate automatically (Let's Encrypt by
+	// default). When enabled, cert_file/key_file are ignored. Only meaningful
+	// on server.tls; the admin and WebDAV listeners reuse the same certificate
+	// manager when their tls.enabled is set without their own files.
+	ACME ACMEConfig `yaml:"acme"`
+}
+
+// ACMEConfig configures automatic certificates via the ACME protocol.
+type ACMEConfig struct {
+	Enabled bool `yaml:"enabled"`
+	// Domains is the allow-list of hostnames certificates are issued for.
+	// With server.virtual_host_domains, add the bucket subdomains you need
+	// (wildcards are not supported by HTTP-01/TLS-ALPN-01).
+	Domains []string `yaml:"domains"`
+	// Email receives expiry notices from the CA (recommended by Let's Encrypt).
+	Email string `yaml:"email"`
+	// AcceptTOS must be true; it records that the operator accepted the CA's
+	// terms of service.
+	AcceptTOS bool `yaml:"accept_tos"`
+	// CacheDir stores account keys and issued certificates (default
+	// "<database dir>/acme"). Back it up with the rest of .cloodsys3.
+	CacheDir string `yaml:"cache_dir"`
+	// DirectoryURL overrides the CA (e.g. Let's Encrypt staging while testing).
+	DirectoryURL string `yaml:"directory_url"`
+	// HTTPListen is the plain-HTTP listener used for the HTTP-01 challenge
+	// and for redirecting http:// requests to https://. Default ":80";
+	// set to "" to disable it and rely on the TLS-ALPN-01 challenge only
+	// (which needs server.listen to be reachable on port 443).
+	HTTPListen *string `yaml:"http_listen"`
 }
 
 type DatabaseConfig struct {
@@ -214,6 +244,13 @@ func applyDefaults(cfg *Config) {
 		t := true
 		cfg.Update.CheckOnStart = &t
 	}
+	if cfg.Server.TLS.ACME.HTTPListen == nil {
+		def := ":80"
+		cfg.Server.TLS.ACME.HTTPListen = &def
+	}
+	if cfg.Server.TLS.ACME.CacheDir == "" {
+		cfg.Server.TLS.ACME.CacheDir = filepath.Join(filepath.Dir(cfg.Database.Path), "acme")
+	}
 	// Secondary listeners reuse the S3 listener's certificate when TLS is
 	// switched on for them without their own cert/key. TLS is never enabled
 	// implicitly so existing GUI/WebDAV clients keep working after an upgrade.
@@ -246,6 +283,21 @@ func applyEnv(cfg *Config) {
 	if v, ok := os.LookupEnv("CLOODSYS3_TLS_ENABLED"); ok {
 		cfg.Server.TLS.Enabled, _ = strconv.ParseBool(v)
 	}
+	if v, ok := os.LookupEnv("CLOODSYS3_ACME_ENABLED"); ok {
+		cfg.Server.TLS.ACME.Enabled, _ = strconv.ParseBool(v)
+	}
+	if v, ok := os.LookupEnv("CLOODSYS3_ACME_DOMAINS"); ok && v != "" {
+		cfg.Server.TLS.ACME.Domains = cfg.Server.TLS.ACME.Domains[:0]
+		for _, d := range strings.Split(v, ",") {
+			if d = strings.TrimSpace(d); d != "" {
+				cfg.Server.TLS.ACME.Domains = append(cfg.Server.TLS.ACME.Domains, d)
+			}
+		}
+	}
+	set("CLOODSYS3_ACME_EMAIL", &cfg.Server.TLS.ACME.Email)
+	if v, ok := os.LookupEnv("CLOODSYS3_ACME_ACCEPT_TOS"); ok {
+		cfg.Server.TLS.ACME.AcceptTOS, _ = strconv.ParseBool(v)
+	}
 	if v, ok := os.LookupEnv("CLOODSYS3_ADMIN_ENABLED"); ok {
 		cfg.Admin.Enabled, _ = strconv.ParseBool(v)
 	}
@@ -271,9 +323,43 @@ func (cfg *Config) Validate() error {
 	if cfg.WebDAV.Enabled && (cfg.WebDAV.Listen == cfg.Server.Listen || (cfg.Admin.Enabled && cfg.WebDAV.Listen == cfg.Admin.Listen)) {
 		return fmt.Errorf("webdav.listen must differ from the other listeners")
 	}
+	acme := cfg.Server.TLS.ACME
+	if acme.Enabled {
+		if !cfg.Server.TLS.Enabled {
+			return fmt.Errorf("server.tls.acme.enabled requires server.tls.enabled")
+		}
+		if len(acme.Domains) == 0 {
+			return fmt.Errorf("server.tls.acme.domains must list at least one hostname")
+		}
+		for _, d := range acme.Domains {
+			if d == "" || strings.ContainsAny(d, " /:*") || net.ParseIP(d) != nil {
+				return fmt.Errorf("server.tls.acme.domains: %q is not a valid hostname (IPs and wildcards are not supported)", d)
+			}
+		}
+		if !acme.AcceptTOS {
+			return fmt.Errorf("server.tls.acme.accept_tos must be true to request certificates")
+		}
+		if acme.Email != "" && !strings.Contains(acme.Email, "@") {
+			return fmt.Errorf("server.tls.acme.email: %q is not an email address", acme.Email)
+		}
+		if acme.HTTPListen != nil && *acme.HTTPListen != "" {
+			if _, _, err := net.SplitHostPort(*acme.HTTPListen); err != nil {
+				return fmt.Errorf("server.tls.acme.http_listen: invalid listen address %q: %w", *acme.HTTPListen, err)
+			}
+			if *acme.HTTPListen == cfg.Server.Listen {
+				return fmt.Errorf("server.tls.acme.http_listen must differ from server.listen")
+			}
+		}
+		if acme.DirectoryURL != "" && !strings.HasPrefix(acme.DirectoryURL, "https://") {
+			return fmt.Errorf("server.tls.acme.directory_url must be an https:// URL")
+		}
+	}
 	for name, t := range map[string]TLSConfig{"server.tls": cfg.Server.TLS, "admin.tls": cfg.Admin.TLS, "webdav.tls": cfg.WebDAV.TLS} {
 		if !t.Enabled {
 			continue
+		}
+		if acme.Enabled && t.CertFile == "" && t.KeyFile == "" {
+			continue // certificate comes from the ACME manager
 		}
 		if t.CertFile == "" || t.KeyFile == "" {
 			return fmt.Errorf("%s: cert_file and key_file are required when enabled", name)

@@ -6,7 +6,21 @@ All notable changes to Cloodsy S3 are documented here. The format follows
 
 ## [Unreleased]
 
-Nothing yet.
+### Added
+
+- **Automatic TLS certificates via ACME (Let's Encrypt)**: `server.tls.acme`
+  obtains and renews certificates with the HTTP-01 (port 80 listener that
+  also redirects to HTTPS) or TLS-ALPN-01 challenge, caches them under
+  `<database dir>/acme/`, and shares them with the Admin API and WebDAV
+  listeners. Configurable with `CLOODSYS3_ACME_*` environment variables; a
+  staging `directory_url` is supported for testing. (#15)
+
+### Changed
+
+- Go 1.27.2 toolchain; Docker build image `golang:1.27-alpine`.
+- `modernc.org/sqlite` 1.60.1 (SQLite 3.53.4), `golang.org/x/crypto` 0.58.0,
+  `x/net` 0.61.0, `x/image` 0.47.0, `x/term` 0.47.0. No known
+  vulnerabilities reported by `govulncheck`.
 
 ## [1.2.0] - 2026-09-15
 

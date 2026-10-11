@@ -1,12 +1,15 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"os"
 	"strconv"
 	"strings"
 
+	"github.com/onaonbir/Cloodsy-S3/acme"
 	"github.com/onaonbir/Cloodsy-S3/admin"
 	"github.com/onaonbir/Cloodsy-S3/cli"
 	"github.com/onaonbir/Cloodsy-S3/config"
@@ -103,7 +106,8 @@ Options:
 
 Environment overrides: CLOODSYS3_LISTEN, CLOODSYS3_ADMIN_LISTEN, CLOODSYS3_WEBDAV_LISTEN,
   CLOODSYS3_DB_PATH, CLOODSYS3_DATA_DIR, CLOODSYS3_LOG_LEVEL, CLOODSYS3_LOG_FORMAT,
-  CLOODSYS3_TLS_ENABLED, CLOODSYS3_TLS_CERT, CLOODSYS3_TLS_KEY, CLOODSYS3_ADMIN_ENABLED,
+  CLOODSYS3_TLS_ENABLED, CLOODSYS3_TLS_CERT, CLOODSYS3_TLS_KEY, CLOODSYS3_ACME_ENABLED,
+  CLOODSYS3_ACME_DOMAINS, CLOODSYS3_ACME_EMAIL, CLOODSYS3_ACME_ACCEPT_TOS, CLOODSYS3_ADMIN_ENABLED,
   CLOODSYS3_WEBDAV_ENABLED, CLOODSYS3_UPDATE_CHECK`)
 }
 
@@ -172,6 +176,16 @@ func openDB(cfg *config.Config) *db.DB {
 		os.Exit(1)
 	}
 	return database
+}
+
+// publicPortSuffix returns ":port" for non-443 TLS listeners so http->https
+// redirects land on the right port, and "" for 443.
+func publicPortSuffix(listen string) string {
+	_, port, err := net.SplitHostPort(listen)
+	if err != nil || port == "" || port == "443" {
+		return ""
+	}
+	return ":" + port
 }
 
 func unwrapErr(err error) error {
@@ -292,6 +306,41 @@ func runServe() {
 		cfg.Server.TLS.Enabled, cfg.Admin.Enabled,
 	)
 
+	// Automatic certificates (ACME / Let's Encrypt): one manager shared by
+	// every TLS listener. Started before the listeners so HTTP-01 can answer.
+	var acmeMgr *acme.Manager
+	if cfg.Server.TLS.Enabled && cfg.Server.TLS.ACME.Enabled {
+		a := cfg.Server.TLS.ACME
+		httpListen := ""
+		if a.HTTPListen != nil {
+			httpListen = *a.HTTPListen
+		}
+		mgr, err := acme.New(acme.Config{
+			Domains:        a.Domains,
+			Email:          a.Email,
+			AcceptTOS:      a.AcceptTOS,
+			CacheDir:       a.CacheDir,
+			DirectoryURL:   a.DirectoryURL,
+			HTTPListen:     httpListen,
+			RedirectTarget: "https://" + a.Domains[0] + publicPortSuffix(cfg.Server.Listen),
+		}, logger)
+		if err != nil {
+			pterm.Error.Printfln("ACME: %v", err)
+			os.Exit(1)
+		}
+		if err := mgr.StartHTTP(); err != nil {
+			pterm.Error.Printfln("ACME: %v (port 80 needs CAP_NET_BIND_SERVICE or a root-owned port; see the systemd notes)", err)
+			os.Exit(1)
+		}
+		defer mgr.Stop()
+		acmeMgr = mgr
+		tc := mgr.TLSConfig()
+		server.TLSConfig = tc
+		webdav.TLSConfig = tc
+		logger.Info("ACME enabled", "domains", strings.Join(a.Domains, ","), "cache", a.CacheDir, "httpListen", httpListen)
+		go mgr.Warm(context.Background())
+	}
+
 	if cfg.Update.CheckOnStart != nil && *cfg.Update.CheckOnStart {
 		go cli.CheckUpdateInBackground(Version, func(format string, args ...any) {
 			logger.Warn(fmt.Sprintf(format, args...))
@@ -305,6 +354,9 @@ func runServe() {
 		adminHandler := admin.New(database, store, cfg, logger)
 		adminHandler.Version = Version
 		adminHandler.Objects = h.Objects
+		if acmeMgr != nil {
+			adminHandler.TLSConfig = server.TLSConfig
+		}
 		adminSrv := admin.RunServer(adminHandler, cfg.Admin.Listen, logger)
 		defer admin.StopServer(adminSrv, logger)
 	}

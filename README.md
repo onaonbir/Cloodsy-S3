@@ -543,6 +543,12 @@ server:
     enabled: false
     cert_file: ""
     key_file: ""
+    acme:                           # automatic certificates (Let's Encrypt), see "Automatic TLS" below
+      enabled: false
+      domains: []
+      email: ""
+      accept_tos: false
+      http_listen: ":80"
   cors_origins: []                  # browser origins allowed on the S3 API (empty = no CORS headers)
   virtual_host_domains: []          # ["s3.example.com"] enables <bucket>.s3.example.com addressing
   max_connections: 0                # 0 = unlimited
@@ -611,6 +617,7 @@ The most common settings can be overridden without a config file — useful unde
 | `CLOODSYS3_LISTEN` | `server.listen` |
 | `CLOODSYS3_REGION` | `server.region` |
 | `CLOODSYS3_TLS_ENABLED` / `CLOODSYS3_TLS_CERT` / `CLOODSYS3_TLS_KEY` | `server.tls.*` |
+| `CLOODSYS3_ACME_ENABLED` / `CLOODSYS3_ACME_DOMAINS` (comma separated) / `CLOODSYS3_ACME_EMAIL` / `CLOODSYS3_ACME_ACCEPT_TOS` | `server.tls.acme.*` |
 | `CLOODSYS3_DB_PATH` | `database.path` |
 | `CLOODSYS3_DATA_DIR` | `storage.root_dir` |
 | `CLOODSYS3_LOG_LEVEL` / `CLOODSYS3_LOG_FORMAT` | `logging.*` |
@@ -689,6 +696,26 @@ The server also checks for updates once on startup and logs a warning if a newer
 update:
   check_on_start: false     # or CLOODSYS3_UPDATE_CHECK=false
 ```
+
+### Automatic TLS (Let's Encrypt)
+
+Instead of managing certificate files, let the server obtain and renew them through the ACME protocol. Certificates are issued on first use, cached under `<database dir>/acme/` and renewed 30 days before expiry. One certificate manager serves the S3 API and, when their `tls.enabled` is set without files, the Admin API and WebDAV listeners too.
+
+```yaml
+server:
+  listen: ":443"
+  tls:
+    enabled: true
+    acme:
+      enabled: true
+      domains: ["s3.example.com"]   # every hostname clients will use; no wildcards
+      email: "ops@example.com"      # expiry notices from the CA
+      accept_tos: true              # required: Let's Encrypt terms of service
+      http_listen: ":80"            # HTTP-01 challenge + http->https redirect ("" = TLS-ALPN-01 only)
+      # directory_url: "https://acme-staging-v02.api.letsencrypt.org/directory"   # while testing
+```
+
+Requirements: the DNS name(s) must resolve to this host, port 80 (HTTP-01) or 443 (TLS-ALPN-01) must be reachable from the internet, and the process must be allowed to bind those ports (under systemd add `AmbientCapabilities=CAP_NET_BIND_SERVICE`, see the unit file; in Docker publish `-p 80:80 -p 443:443`). With `virtual_host_domains`, list each bucket hostname (`photos.s3.example.com`) in `domains`. Use the staging directory first; Let's Encrypt rate-limits failed production issuances. Back up the `acme/` directory together with the rest of `.cloodsys3/`.
 
 ## Deployment
 

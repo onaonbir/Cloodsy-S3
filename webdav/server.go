@@ -3,9 +3,11 @@ package webdav
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
 	"errors"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -25,6 +27,10 @@ import (
 // in either direction, so multi-GB transfers are never cut off mid-way.
 const progressIdle = 60 * time.Second
 
+// TLSConfig, when set by the caller, serves the WebDAV listener with an
+// ACME-managed certificate instead of webdav.tls.cert_file/key_file.
+var TLSConfig *tls.Config
+
 // RunServer starts the WebDAV listener and returns its *http.Server (nil on
 // listen failure). Mirrors admin.RunServer so main can manage it the same way.
 func RunServer(database *db.DB, store storage.Backend, objects *service.Objects, cfg *config.Config, logger *slog.Logger) *http.Server {
@@ -40,10 +46,17 @@ func RunServer(database *db.DB, store storage.Backend, objects *service.Objects,
 	}
 
 	certFile, keyFile := "", ""
-	if cfg.WebDAV.TLS.Enabled {
-		certFile, keyFile = cfg.WebDAV.TLS.CertFile, cfg.WebDAV.TLS.KeyFile
+	var ln net.Listener
+	var err error
+	if cfg.WebDAV.TLS.Enabled && TLSConfig != nil {
+		certFile = "acme"
+		ln, err = httpx.ListenTLS(cfg.WebDAV.Listen, TLSConfig, cfg.Server.MaxConnections)
+	} else {
+		if cfg.WebDAV.TLS.Enabled {
+			certFile, keyFile = cfg.WebDAV.TLS.CertFile, cfg.WebDAV.TLS.KeyFile
+		}
+		ln, err = httpx.Listen(cfg.WebDAV.Listen, certFile, keyFile, cfg.Server.MaxConnections)
 	}
-	ln, err := httpx.Listen(cfg.WebDAV.Listen, certFile, keyFile, cfg.Server.MaxConnections)
 	if err != nil {
 		logger.Error("webdav server listen failed", "addr", cfg.WebDAV.Listen, "error", err)
 		return nil

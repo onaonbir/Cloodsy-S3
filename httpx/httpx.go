@@ -114,7 +114,27 @@ func MaxBody(next http.Handler, n int64) http.Handler {
 }
 
 // Listen opens a TCP listener, optionally TLS-wrapped and connection-capped.
+// Pass a certificate/key pair for static TLS; see ListenTLS for a prebuilt
+// *tls.Config (ACME).
 func Listen(addr string, tlsCert, tlsKey string, maxConns int) (net.Listener, error) {
+	var tc *tls.Config
+	if tlsCert != "" && tlsKey != "" {
+		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
+		if err != nil {
+			return nil, fmt.Errorf("load TLS key pair: %w", err)
+		}
+		tc = &tls.Config{
+			Certificates: []tls.Certificate{cert},
+			MinVersion:   tls.VersionTLS12,
+			NextProtos:   []string{"h2", "http/1.1"},
+		}
+	}
+	return ListenTLS(addr, tc, maxConns)
+}
+
+// ListenTLS opens a TCP listener wrapped with the given TLS configuration
+// (nil = plain TCP) and optionally connection-capped.
+func ListenTLS(addr string, tc *tls.Config, maxConns int) (net.Listener, error) {
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
 		return nil, err
@@ -122,17 +142,8 @@ func Listen(addr string, tlsCert, tlsKey string, maxConns int) (net.Listener, er
 	if maxConns > 0 {
 		ln = netutil.LimitListener(ln, maxConns)
 	}
-	if tlsCert != "" && tlsKey != "" {
-		cert, err := tls.LoadX509KeyPair(tlsCert, tlsKey)
-		if err != nil {
-			ln.Close()
-			return nil, fmt.Errorf("load TLS key pair: %w", err)
-		}
-		ln = tls.NewListener(ln, &tls.Config{
-			Certificates: []tls.Certificate{cert},
-			MinVersion:   tls.VersionTLS12,
-			NextProtos:   []string{"h2", "http/1.1"},
-		})
+	if tc != nil {
+		ln = tls.NewListener(ln, tc)
 	}
 	return ln, nil
 }

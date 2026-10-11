@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 
@@ -39,7 +40,13 @@ func RunServer(handler *Handler, listen string, logger *slog.Logger) *http.Serve
 
 	certFile, keyFile := "", ""
 	scheme := "http"
-	if handler != nil && handler.Config != nil && handler.Config.Admin.TLS.Enabled {
+	var ln net.Listener
+	var err error
+	switch {
+	case handler != nil && handler.Config != nil && handler.Config.Admin.TLS.Enabled && handler.TLSConfig != nil:
+		scheme = "https"
+		ln, err = httpx.ListenTLS(listen, handler.TLSConfig, 0)
+	case handler != nil && handler.Config != nil && handler.Config.Admin.TLS.Enabled:
 		certFile = handler.Config.Admin.TLS.CertFile
 		keyFile = handler.Config.Admin.TLS.KeyFile
 		if certFile == "" || keyFile == "" {
@@ -47,9 +54,10 @@ func RunServer(handler *Handler, listen string, logger *slog.Logger) *http.Serve
 			return nil
 		}
 		scheme = "https"
+		ln, err = httpx.Listen(listen, certFile, keyFile, 0)
+	default:
+		ln, err = httpx.Listen(listen, "", "", 0)
 	}
-
-	ln, err := httpx.Listen(listen, certFile, keyFile, 0)
 	if err != nil {
 		logger.Error("admin server listen failed", "addr", listen, "error", err)
 		return nil

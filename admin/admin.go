@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -67,6 +68,9 @@ type Handler struct {
 	// instance; main replaces it with the one used by the S3 API so that
 	// webhooks and image jobs are shared.
 	Objects *service.Objects
+	// TLSConfig, when set, serves the admin listener with an ACME-managed
+	// certificate instead of admin.tls.cert_file/key_file.
+	TLSConfig *tls.Config
 
 	sessionTTL     time.Duration
 	trustedProxies []*net.IPNet

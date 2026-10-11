@@ -10,7 +10,8 @@
 #   CLOODSYS3_REGION          server.region
 #   CLOODSYS3_TLS_ENABLED     server.tls.enabled (true/false)
 #   CLOODSYS3_TLS_CERT        server.tls.cert_file
-#   CLOODSYS3_TLS_KEY         server.tls.key_file
+#   CLOODSYS3_TLS_KEY, CLOODSYS3_ACME_ENABLED, CLOODSYS3_ACME_DOMAINS (comma separated),
+#   CLOODSYS3_ACME_EMAIL, CLOODSYS3_ACME_ACCEPT_TOS         server.tls.key_file
 #   CLOODSYS3_DB_PATH         database.path
 #   CLOODSYS3_DATA_DIR        storage.root_dir
 #   CLOODSYS3_LOG_LEVEL       logging.level
@@ -26,8 +27,16 @@ server:
   region: "us-east-1"             # Region name used for SigV4 scope checks
   tls:
     enabled: false                # Serve the S3 API over HTTPS
-    cert_file: ""                 # PEM certificate (required when enabled)
-    key_file: ""                  # PEM private key (required when enabled)
+    cert_file: ""                 # PEM certificate (required when enabled, unless acme.enabled)
+    key_file: ""                  # PEM private key (required when enabled, unless acme.enabled)
+    acme:                         # Automatic certificates from Let's Encrypt (ACME)
+      enabled: false              # When true, cert_file/key_file are ignored
+      domains: []                 # Hostnames to issue for, e.g. ["s3.example.com"]; no wildcards
+      email: ""                   # Expiry notices from the CA (recommended)
+      accept_tos: false           # Must be true: you accept the CA's terms of service
+      cache_dir: ""               # Account key + certificates; default "<database dir>/acme"
+      directory_url: ""           # Override the CA, e.g. Let's Encrypt staging while testing
+      http_listen: ":80"          # HTTP-01 challenge + http->https redirect listener; "" = TLS-ALPN-01 only
   cors_origins: []                # Browser origins allowed to call the S3 API, e.g. ["https://app.example.com"].
                                   # Empty = no CORS headers are sent (browser clients will fail preflight).
   virtual_host_domains: []        # Enable virtual-hosted-style requests: with ["s3.example.com"] a request
