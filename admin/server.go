@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/onaonbir/Cloodsy-S3/httpx"
+	"github.com/onaonbir/Cloodsy-S3/metrics"
 )
 
 // progressIdle is the per-request idle timeout: a connection that neither
@@ -16,17 +17,32 @@ import (
 // capped so slow-but-alive clients are never cut off.
 const progressIdle = 60 * time.Second
 
-// RunServer starts the Admin API listener. It returns nil when the listener
-// could not be opened (the error is logged).
-func RunServer(handler *Handler, listen string, logger *slog.Logger) *http.Server {
+// newRootHandler builds the listener's handler chain: request metrics, panic
+// recovery, the per-request idle (progress) timeout and the JSON body cap.
+// The cap applies to every endpoint except the streaming uploads
+// (PUT /admin/buckets/{bucket}/object and multipart part uploads), whose size
+// is bounded by quota and the per-object/per-part maximum instead.
+func newRootHandler(handler *Handler, logger *slog.Logger) http.Handler {
 	mux := http.NewServeMux()
 	mux.Handle("/admin/", handler)
 
-	// Every admin endpoint carries a small JSON body (there is no streaming
-	// object upload on this listener), so a global body cap is safe.
-	var root http.Handler = httpx.MaxBody(mux, maxJSONBody)
+	capped := httpx.MaxBody(mux, maxJSONBody)
+	var root http.Handler = http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if isObjectUpload(r) {
+			mux.ServeHTTP(w, r)
+			return
+		}
+		capped.ServeHTTP(w, r)
+	})
 	root = httpx.ProgressTimeout(root, progressIdle)
 	root = httpx.Recover(root, logger)
+	return metrics.Middleware(root, metrics.Admin)
+}
+
+// RunServer starts the Admin API listener. It returns nil when the listener
+// could not be opened (the error is logged).
+func RunServer(handler *Handler, listen string, logger *slog.Logger) *http.Server {
+	root := newRootHandler(handler, logger)
 
 	srv := &http.Server{
 		Addr:              listen,
@@ -87,4 +103,13 @@ func StopServer(srv *http.Server, logger *slog.Logger) {
 	if err := srv.Shutdown(ctx); err != nil {
 		logger.Error("admin server shutdown error", "error", err)
 	}
+}
+
+// clearDeadlines lifts the progress (idle) deadline for a request that does
+// long server-side work without moving bytes (multipart assembly, large
+// copies). The deadline is re-armed by the next byte written.
+func clearDeadlines(w http.ResponseWriter) {
+	rc := http.NewResponseController(w)
+	_ = rc.SetReadDeadline(time.Time{})
+	_ = rc.SetWriteDeadline(time.Time{})
 }

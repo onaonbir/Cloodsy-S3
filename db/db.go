@@ -209,6 +209,22 @@ var migrations = []migration{
 		`UPDATE objects SET is_latest = 0 WHERE is_latest = 1 AND id NOT IN (
 			SELECT MAX(id) FROM objects WHERE is_latest = 1 GROUP BY bucket_id, key)`,
 	}},
+	{3, []string{
+		// Webhook delivery log (newest WebhookDeliveryKeep rows per hook).
+		`CREATE TABLE IF NOT EXISTS webhook_deliveries (
+			id INTEGER PRIMARY KEY AUTOINCREMENT,
+			webhook_id INTEGER NOT NULL,
+			event_type TEXT NOT NULL DEFAULT '',
+			object_key TEXT NOT NULL DEFAULT '',
+			status_code INTEGER NOT NULL DEFAULT 0,
+			error TEXT NOT NULL DEFAULT '',
+			duration_ms INTEGER NOT NULL DEFAULT 0,
+			attempt INTEGER NOT NULL DEFAULT 1,
+			created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+			FOREIGN KEY (webhook_id) REFERENCES bucket_webhooks(id) ON DELETE CASCADE
+		)`,
+		"CREATE INDEX IF NOT EXISTS idx_webhook_deliveries_hook ON webhook_deliveries(webhook_id, id)",
+	}},
 }
 
 func (d *DB) migrate() error {

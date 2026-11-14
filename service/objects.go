@@ -24,6 +24,10 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/webhook"
 )
 
+// MaxPutObjectSize caps a single-request object write (S3 PutObject, Admin
+// API upload); larger objects need multipart upload.
+const MaxPutObjectSize int64 = 5 * 1024 * 1024 * 1024 // 5 GB
+
 var (
 	ErrQuotaExceeded = errors.New("bucket quota exceeded")
 	ErrTooLarge      = storage.ErrTooLarge
@@ -41,7 +45,7 @@ type Objects struct {
 	Logger     *slog.Logger
 
 	locks       keyLocks
-	uploadLocks keyLocks
+	uploadLocks uploadLocks
 }
 
 // New creates a service bound to the given dependencies.
@@ -55,21 +59,97 @@ type keyLocks struct {
 	stripes [256]sync.Mutex
 }
 
-func (k *keyLocks) lock(bucketID int64, key string) func() {
+func stripeOf(bucketID int64, key string) int {
 	h := fnv.New32a()
 	fmt.Fprintf(h, "%d/%s", bucketID, key)
-	m := &k.stripes[h.Sum32()%uint32(len(k.stripes))]
+	return int(h.Sum32() % 256)
+}
+
+func (k *keyLocks) lock(bucketID int64, key string) func() {
+	m := &k.stripes[stripeOf(bucketID, key)]
 	m.Lock()
 	return m.Unlock
+}
+
+// lockPair locks two keys at once. Two keys can share a stripe, so the
+// stripes are deduplicated and taken in ascending order: callers holding
+// several keys never deadlock against each other or themselves.
+func (k *keyLocks) lockPair(b1 int64, k1 string, b2 int64, k2 string) func() {
+	s1, s2 := stripeOf(b1, k1), stripeOf(b2, k2)
+	if s1 == s2 {
+		k.stripes[s1].Lock()
+		return k.stripes[s1].Unlock
+	}
+	if s1 > s2 {
+		s1, s2 = s2, s1
+	}
+	k.stripes[s1].Lock()
+	k.stripes[s2].Lock()
+	return func() {
+		k.stripes[s2].Unlock()
+		k.stripes[s1].Unlock()
+	}
 }
 
 // Lock acquires the per-key lock for callers that run multi-step operations
 // (e.g. multipart completion) outside Put/Delete.
 func (s *Objects) Lock(bucketID int64, key string) func() { return s.locks.lock(bucketID, key) }
 
-// LockUpload serializes operations on one multipart upload. It uses a separate
-// lock set so it can be held together with Lock without deadlocking.
-func (s *Objects) LockUpload(uploadID string) func() { return s.uploadLocks.lock(0, uploadID) }
+// uploadLocks holds one reader/writer lock per multipart upload id, created
+// on demand and dropped when unused. Part uploads share the read side (so a
+// client may upload parts of one upload in parallel); completion and abort
+// take the write side. Distinct uploads never contend.
+type uploadLocks struct {
+	mu sync.Mutex
+	m  map[string]*uploadLock
+}
+
+type uploadLock struct {
+	rw   sync.RWMutex
+	refs int
+}
+
+func (u *uploadLocks) acquire(id string, write bool) func() {
+	u.mu.Lock()
+	if u.m == nil {
+		u.m = make(map[string]*uploadLock)
+	}
+	l := u.m[id]
+	if l == nil {
+		l = &uploadLock{}
+		u.m[id] = l
+	}
+	l.refs++
+	u.mu.Unlock()
+
+	if write {
+		l.rw.Lock()
+	} else {
+		l.rw.RLock()
+	}
+	return func() {
+		if write {
+			l.rw.Unlock()
+		} else {
+			l.rw.RUnlock()
+		}
+		u.mu.Lock()
+		l.refs--
+		if l.refs == 0 {
+			delete(u.m, id)
+		}
+		u.mu.Unlock()
+	}
+}
+
+// LockUpload serializes completion and abort of one multipart upload and
+// waits for in-flight part uploads of it. It is independent of Lock, so both
+// can be held together (upload first, then key) without deadlocking.
+func (s *Objects) LockUpload(uploadID string) func() { return s.uploadLocks.acquire(uploadID, true) }
+
+// rlockUpload is held by part uploads: parts of one upload run in parallel,
+// but never alongside its completion or abort.
+func (s *Objects) rlockUpload(uploadID string) func() { return s.uploadLocks.acquire(uploadID, false) }
 
 // --- versioning helpers ----------------------------------------------------
 
@@ -134,19 +214,30 @@ type PutResult struct {
 // Put writes an object honoring bucket versioning and quota. All checks that
 // can fail run before the previous object's bytes are replaced.
 func (s *Objects) Put(in PutInput) (*PutResult, error) {
-	b := in.Bucket
+	if err := s.precheckPut(in); err != nil {
+		return nil, err
+	}
+	unlock := s.locks.lock(in.Bucket.ID, in.Key)
+	defer unlock()
+	return s.putLocked(in)
+}
+
+// precheckPut rejects a write early from its declared size (no lock needed).
+func (s *Objects) precheckPut(in PutInput) error {
 	if in.DeclaredSize >= 0 {
 		if in.MaxSize > 0 && in.DeclaredSize > in.MaxSize {
-			return nil, ErrTooLarge
+			return ErrTooLarge
 		}
-		if err := s.checkQuota(b, in.Key, in.DeclaredSize); err != nil {
-			return nil, err
+		if err := s.checkQuota(in.Bucket, in.Key, in.DeclaredSize); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	unlock := s.locks.lock(b.ID, in.Key)
-	defer unlock()
-
+// putLocked performs Put; the caller holds the key lock of in.Key.
+func (s *Objects) putLocked(in PutInput) (*PutResult, error) {
+	b := in.Bucket
 	versionID := VersionIDForPut(b)
 	opts := storage.PutOptions{
 		MaxSize: in.MaxSize,

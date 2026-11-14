@@ -7,7 +7,6 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"encoding/xml"
 	"errors"
 	"fmt"
@@ -33,18 +32,13 @@ import (
 
 // Limits
 const (
-	maxObjectSize     int64 = 5 * 1024 * 1024 * 1024        // 5 GB per PutObject
-	maxPartSize       int64 = 5 * 1024 * 1024 * 1024        // 5 GB per part
-	minPartSize       int64 = 5 * 1024 * 1024               // 5 MB for every part except the last
-	maxMultipartSize  int64 = 5 * 1024 * 1024 * 1024 * 1024 // 5 TB max assembled multipart
-	maxXMLBodySize    int64 = 1 * 1024 * 1024               // 1 MB for XML request bodies
-	maxDeleteObjects        = 1000                          // S3 limit for batch delete
-	maxMetadataSize         = 2048                          // 2 KB total metadata per S3 spec
-	maxMetadataKeyLen       = 128                           // Max metadata key length
-	maxMetadataValLen       = 256                           // Max metadata value length
-	maxChunkSize      int64 = 5 * 1024 * 1024 * 1024        // Max chunk size in aws-chunked
-	maxParts                = 10000                         // S3 max parts per multipart upload
-	maxKeyLength            = 1024
+	maxObjectSize    int64 = service.MaxPutObjectSize // 5 GB per PutObject
+	maxPartSize      int64 = service.MaxPartSize      // 5 GB per part
+	maxXMLBodySize   int64 = 1 * 1024 * 1024          // 1 MB for XML request bodies
+	maxDeleteObjects       = 1000                     // S3 limit for batch delete
+	maxChunkSize     int64 = 5 * 1024 * 1024 * 1024   // Max chunk size in aws-chunked
+	maxParts               = service.MaxParts         // S3 max parts per multipart upload
+	maxKeyLength           = 1024
 )
 
 // validBucketName matches S3 bucket naming rules: 3-63 chars, lowercase alphanumeric + hyphens, no leading/trailing hyphens.
@@ -354,6 +348,18 @@ func (h *Handler) writeServiceError(w http.ResponseWriter, r *http.Request, err 
 		s3err.WriteError(w, r, s3err.ErrNoSuchKey)
 	case errors.Is(err, service.ErrNoSuchVersion):
 		s3err.WriteError(w, r, s3err.ErrNoSuchVersion)
+	case errors.Is(err, service.ErrNoSuchUpload):
+		s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
+	case errors.Is(err, service.ErrInvalidPart):
+		s3err.WriteError(w, r, s3err.ErrInvalidPart)
+	case errors.Is(err, service.ErrInvalidPartOrder):
+		s3err.WriteError(w, r, s3err.ErrInvalidPartOrder)
+	case errors.Is(err, service.ErrEntityTooSmall):
+		s3err.WriteError(w, r, s3err.ErrEntityTooSmall)
+	case errors.Is(err, service.ErrMetadataTooLarge):
+		s3err.WriteError(w, r, s3err.ErrMetadataTooLarge)
+	case errors.Is(err, service.ErrInvalidMetadata):
+		s3err.WriteError(w, r, s3err.ErrInvalidArgument)
 	case errors.Is(err, errIncompleteChunked):
 		s3err.WriteError(w, r, s3err.ErrIncompleteBody)
 	case errors.Is(err, errMalformedChunk), errors.Is(err, errChunkTooLarge):
@@ -553,27 +559,15 @@ var systemHeaders = map[string]string{
 // collectMetadata gathers x-amz-meta-* headers and the persisted system
 // headers into a JSON string. Returns an error when S3 limits are exceeded.
 func collectMetadata(r *http.Request) (string, error) {
-	meta := make(map[string]string)
-	totalSize := 0
+	user := make(map[string]string)
 	for key, vals := range r.Header {
 		lower := strings.ToLower(key)
 		if !strings.HasPrefix(lower, "x-amz-meta-") {
 			continue
 		}
-		metaKey := strings.TrimPrefix(lower, "x-amz-meta-")
-		val := strings.Join(vals, ",")
-		if len(metaKey) > maxMetadataKeyLen || len(val) > maxMetadataValLen {
-			return "", s3err.ErrMetadataTooLarge
-		}
-		totalSize += len(metaKey) + len(val)
-		if totalSize > maxMetadataSize {
-			return "", s3err.ErrMetadataTooLarge
-		}
-		if strings.ContainsAny(val, "\r\n") {
-			return "", s3err.ErrInvalidArgument
-		}
-		meta[metaKey] = val
+		user[strings.TrimPrefix(lower, "x-amz-meta-")] = strings.Join(vals, ",")
 	}
+	system := make(map[string]string)
 	for hdr, slot := range systemHeaders {
 		if v := r.Header.Get(hdr); v != "" && !strings.ContainsAny(v, "\r\n") {
 			if hdr == "Content-Encoding" && strings.Contains(v, "aws-chunked") {
@@ -589,29 +583,24 @@ func collectMetadata(r *http.Request) (string, error) {
 					continue
 				}
 			}
-			meta[slot] = v
+			system[slot] = v
 		}
 	}
-	if len(meta) == 0 {
-		return "{}", nil
+	meta, err := service.EncodeMetadata(user, system)
+	switch {
+	case errors.Is(err, service.ErrMetadataTooLarge):
+		return "", s3err.ErrMetadataTooLarge
+	case errors.Is(err, service.ErrInvalidMetadata):
+		return "", s3err.ErrInvalidArgument
+	case err != nil:
+		return "", err
 	}
-	data, err := json.Marshal(meta)
-	if err != nil {
-		return "{}", nil
-	}
-	return string(data), nil
+	return meta, nil
 }
 
 // parseMetadata decodes the stored JSON.
 func parseMetadata(metadata string) map[string]string {
-	if metadata == "" || metadata == "{}" {
-		return nil
-	}
-	var meta map[string]string
-	if err := json.Unmarshal([]byte(metadata), &meta); err != nil {
-		return nil
-	}
-	return meta
+	return service.DecodeMetadata(metadata)
 }
 
 // setMetadataHeaders sets x-amz-meta-* and persisted system headers.

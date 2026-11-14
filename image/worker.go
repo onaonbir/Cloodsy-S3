@@ -143,7 +143,7 @@ func OptimizeOne(store VariantStore, job Job, quality int, maxSourceBytes int64)
 		maxSourceBytes = 32 << 20
 	}
 	p := Params{Mode: ModeFit, Quality: quality}
-	cacheKey := storage.VariantCacheKey(job.Key, job.VersionID, job.ETag, p.Spec())
+	cacheKey := OptimizedCacheKey(job.Key, job.VersionID, job.ETag, quality)
 
 	var src io.ReadCloser
 	var err error
@@ -162,6 +162,21 @@ func OptimizeOne(store VariantStore, job Job, quality int, maxSourceBytes int64)
 		return terr
 	}
 	return store.PutVariant(job.Bucket, cacheKey, data)
+}
+
+// EffectiveQuality normalizes a configured quality the way NewWorker does.
+func EffectiveQuality(q int) int {
+	if q <= 0 || q > 100 {
+		return DefaultQuality
+	}
+	return q
+}
+
+// OptimizedCacheKey is the variant cache key of the optimized (no-resize)
+// variant the upload optimizer stores for an object version.
+func OptimizedCacheKey(key, versionID, etag string, quality int) string {
+	p := Params{Mode: ModeFit, Quality: quality}
+	return storage.VariantCacheKey(key, versionID, etag, p.Spec())
 }
 
 // Stop closes the queue and waits for in-flight jobs to finish. Safe to call

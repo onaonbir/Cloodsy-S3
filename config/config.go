@@ -21,6 +21,10 @@ type Config struct {
 	Image    ImageConfig    `yaml:"image"`
 	WebDAV   WebDAVConfig   `yaml:"webdav"`
 	Update   UpdateConfig   `yaml:"update"`
+
+	// Path is the absolute path of the file the config was loaded from
+	// ("" for the built-in defaults). Not part of the YAML document.
+	Path string `yaml:"-"`
 }
 
 // UpdateConfig controls the self-update checks.
@@ -431,6 +435,11 @@ func Load(path string) (*Config, error) {
 	applyDefaults(cfg)
 	if err := cfg.Validate(); err != nil {
 		return nil, err
+	}
+	if abs, err := filepath.Abs(path); err == nil {
+		cfg.Path = abs
+	} else {
+		cfg.Path = path
 	}
 	return cfg, nil
 }

@@ -215,7 +215,8 @@ func setupLogger(cfg *config.Config) *slog.Logger {
 	} else {
 		h = applogger.NewPrettyHandler(os.Stdout, level)
 	}
-	return slog.New(h)
+	// Also keep the most recent records in memory for GET /admin/logs.
+	return slog.New(applogger.Tee(h, applogger.Default))
 }
 
 func openStorage(cfg *config.Config, database *db.DB) *storage.FileSystem {

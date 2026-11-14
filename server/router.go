@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/google/uuid"
@@ -12,17 +13,33 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 )
 
-// maskPresignedQuery replaces sensitive presigned URL params with "***".
+// maskedQueryParams are the presigned URL parameters whose values must never
+// reach the logs (compared case-insensitively after URL decoding).
+var maskedQueryParams = []string{"X-Amz-Signature", "X-Amz-Credential", "X-Amz-Security-Token"}
+
+// maskPresignedQuery replaces the values of sensitive presigned URL params
+// with "***". Names are matched after URL decoding and case-insensitively, so
+// "X%2DAmz%2DSignature" is masked like "X-Amz-Signature"; other parameters
+// keep their raw form and order. A query that does not parse is masked whole.
 func maskPresignedQuery(raw string) string {
+	if raw == "" {
+		return ""
+	}
+	if _, err := url.ParseQuery(raw); err != nil {
+		return "***"
+	}
 	parts := strings.Split(raw, "&")
 	for i, p := range parts {
-		switch {
-		case strings.HasPrefix(p, "X-Amz-Signature="):
-			parts[i] = "X-Amz-Signature=***"
-		case strings.HasPrefix(p, "X-Amz-Credential="):
-			parts[i] = "X-Amz-Credential=***"
-		case strings.HasPrefix(p, "X-Amz-Security-Token="):
-			parts[i] = "X-Amz-Security-Token=***"
+		rawName, _, _ := strings.Cut(p, "=")
+		name, err := url.QueryUnescape(rawName)
+		if err != nil {
+			return "***"
+		}
+		for _, m := range maskedQueryParams {
+			if strings.EqualFold(name, m) {
+				parts[i] = rawName + "=***"
+				break
+			}
 		}
 	}
 	return strings.Join(parts, "&")
@@ -96,10 +113,7 @@ func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 
 	// Mask sensitive query params (presigned URL signatures) in logs
-	logQuery := r.URL.RawQuery
-	if strings.Contains(logQuery, "X-Amz-") {
-		logQuery = maskPresignedQuery(logQuery)
-	}
+	logQuery := maskPresignedQuery(r.URL.RawQuery)
 	sr.logger.Info(r.Method+" "+httpx.SanitizeLog(r.URL.Path),
 		"remote", r.RemoteAddr,
 		"query", httpx.SanitizeLog(logQuery),

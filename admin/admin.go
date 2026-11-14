@@ -2,6 +2,7 @@ package admin
 
 import (
 	"crypto/rand"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/hex"
 	"encoding/json"
@@ -12,11 +13,14 @@ import (
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
+	"unicode/utf8"
 
 	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/db"
 	"github.com/onaonbir/Cloodsy-S3/httpx"
+	applogger "github.com/onaonbir/Cloodsy-S3/logger"
 	"github.com/onaonbir/Cloodsy-S3/service"
 	"github.com/onaonbir/Cloodsy-S3/storage"
 	"golang.org/x/crypto/bcrypt"
@@ -47,9 +51,24 @@ const (
 const dummyPasswordHash = "$2a$12$4mFyUCH08Omoz829Wy8HfuYT0GZmT3fofSYWhvcx6w9trX.bEygNW"
 
 type session struct {
-	Username  string
-	ExpiresAt time.Time
+	ID         string // public identifier (never the token)
+	Username   string
+	CreatedAt  time.Time
+	LastSeenAt time.Time
+	ExpiresAt  time.Time
+	IP         string
+	UserAgent  string
 }
+
+// sessionID derives the public session identifier from a token: the first
+// 12 hex characters of its SHA-256. It cannot be turned back into the token.
+func sessionID(token string) string {
+	sum := sha256.Sum256([]byte(token))
+	return hex.EncodeToString(sum[:])[:12]
+}
+
+// maxUserAgentLen caps the stored User-Agent per session.
+const maxUserAgentLen = 256
 
 type loginAttempt struct {
 	Count       int
@@ -85,6 +104,16 @@ type Handler struct {
 	// reprocess) so they never overlap.
 	busyMu sync.Mutex
 	busy   map[string]string // bucket -> operation
+
+	// scanBusy serializes maintenance scans and orphan deletes (whole-store
+	// walks).
+	scanBusy atomic.Bool
+
+	startedAt time.Time // for uptime_seconds in /admin/status
+
+	// LogRing backs GET /admin/logs; nil uses logger.Default (the ring the
+	// server's logger tees into).
+	LogRing *applogger.Ring
 }
 
 func New(database *db.DB, store *storage.FileSystem, cfg *config.Config, logger *slog.Logger) *Handler {
@@ -98,6 +127,7 @@ func New(database *db.DB, store *storage.FileSystem, cfg *config.Config, logger 
 		sessions:   make(map[string]session),
 		loginRate:  make(map[string]*loginAttempt),
 		busy:       make(map[string]string),
+		startedAt:  time.Now(),
 	}
 	h.trustedProxies = parseTrustedProxies(cfg.Admin.TrustedProxies, logger)
 
@@ -335,27 +365,57 @@ func generateToken() (string, error) {
 	return "cks_" + hex.EncodeToString(b), nil
 }
 
-func (h *Handler) createSession(username string) (string, time.Time, error) {
+func (h *Handler) createSession(username string, r *http.Request) (string, time.Time, error) {
 	token, err := generateToken()
 	if err != nil {
 		return "", time.Time{}, err
 	}
-	expiresAt := time.Now().Add(h.sessionTTL)
+	now := time.Now()
+	expiresAt := now.Add(h.sessionTTL)
+	s := session{ID: sessionID(token), Username: username, CreatedAt: now, LastSeenAt: now, ExpiresAt: expiresAt}
+	if r != nil {
+		s.IP = clientIP(r, h.trustedProxies)
+		s.UserAgent = truncateUTF8(httpx.SanitizeLog(r.UserAgent()), maxUserAgentLen)
+	}
 	h.mu.Lock()
-	h.sessions[token] = session{Username: username, ExpiresAt: expiresAt}
+	h.sessions[token] = s
 	h.mu.Unlock()
 	return token, expiresAt, nil
 }
+
+// truncateUTF8 cuts s to at most n bytes without splitting a rune.
+func truncateUTF8(s string, n int) string {
+	if len(s) <= n {
+		return s
+	}
+	for n > 0 && !utf8.RuneStart(s[n]) {
+		n--
+	}
+	return s[:n]
+}
+
+// sessionTouchInterval limits how often last_seen_at is rewritten (each
+// update takes the write lock).
+const sessionTouchInterval = 5 * time.Second
 
 func (h *Handler) validateToken(token string) (string, bool) {
 	if token == "" {
 		return "", false
 	}
+	now := time.Now()
 	h.mu.RLock()
 	s, ok := h.sessions[token]
 	h.mu.RUnlock()
-	if !ok || time.Now().After(s.ExpiresAt) {
+	if !ok || now.After(s.ExpiresAt) {
 		return "", false
+	}
+	if now.Sub(s.LastSeenAt) >= sessionTouchInterval {
+		h.mu.Lock()
+		if cur, ok := h.sessions[token]; ok {
+			cur.LastSeenAt = now
+			h.sessions[token] = cur
+		}
+		h.mu.Unlock()
 	}
 	return s.Username, true
 }
@@ -405,8 +465,10 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	if origin != "" && h.corsAllowed(origin) {
 		w.Header().Set("Access-Control-Allow-Origin", origin)
-		w.Header().Set("Access-Control-Allow-Methods", "GET, POST, PUT, DELETE, OPTIONS")
-		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type")
+		w.Header().Set("Access-Control-Allow-Methods", "GET, HEAD, POST, PUT, DELETE, OPTIONS")
+		w.Header().Set("Access-Control-Allow-Headers", "Authorization, Content-Type, Range")
+		// Let browser clients read the download/upload metadata headers.
+		w.Header().Set("Access-Control-Expose-Headers", "Accept-Ranges, Content-Disposition, Content-Length, Content-Range, ETag, Last-Modified, X-Version-Id")
 		w.Header().Set("Access-Control-Max-Age", "86400")
 		w.Header().Add("Vary", "Origin")
 	}
@@ -447,6 +509,78 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	case path == "/logout" && r.Method == http.MethodPost:
 		h.deleteSession(token)
 		writeJSON(w, http.StatusOK, map[string]string{"message": "logged out"})
+
+	// GET /admin/sessions, DELETE /admin/sessions/{id}
+	case path == "/sessions" && r.Method == http.MethodGet:
+		h.handleListSessions(w, r, token)
+	case len(parts) == 2 && parts[0] == "sessions" && r.Method == http.MethodDelete:
+		h.handleDeleteSession(w, r, parts[1], token, username)
+
+	// GET /admin/logs, /admin/config, /admin/metrics
+	case path == "/logs" && r.Method == http.MethodGet:
+		h.handleLogs(w, r)
+	case path == "/config" && r.Method == http.MethodGet:
+		h.handleConfig(w, r)
+	case path == "/metrics" && r.Method == http.MethodGet:
+		h.handleMetrics(w, r)
+
+	// POST /admin/maintenance/scan, /admin/maintenance/orphan-dirs/delete
+	case path == "/maintenance/scan" && r.Method == http.MethodPost:
+		h.handleMaintenanceScan(w, r)
+	case path == "/maintenance/orphan-dirs/delete" && r.Method == http.MethodPost:
+		h.handleDeleteOrphanDirs(w, r, username)
+
+	// PUT /admin/webhooks/{id}, GET .../deliveries, POST .../test
+	case len(parts) == 2 && parts[0] == "webhooks" && r.Method == http.MethodPut:
+		h.handleUpdateWebhook(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "webhooks" && parts[2] == "deliveries" && r.Method == http.MethodGet:
+		h.handleWebhookDeliveries(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "webhooks" && parts[2] == "test" && r.Method == http.MethodPost:
+		h.handleTestWebhook(w, r, parts[1])
+
+	// GET /admin/buckets/{name}/object/info?key=, PUT .../object/meta?key=
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "object" && parts[3] == "info" && r.Method == http.MethodGet:
+		h.handleObjectInfo(w, r, parts[1])
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "object" && parts[3] == "meta" && r.Method == http.MethodPut:
+		h.handleUpdateObjectMeta(w, r, parts[1])
+
+	// HEAD /admin/buckets/{name}/object?key= (download headers only)
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "object" && r.Method == http.MethodHead:
+		h.handleDownloadObject(w, r, parts[1])
+
+	// POST /admin/buckets/{name}/objects/copy, .../objects/copy-prefix
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "objects" && parts[3] == "copy" && r.Method == http.MethodPost:
+		h.handleCopyObject(w, r, parts[1])
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "objects" && parts[3] == "copy-prefix" && r.Method == http.MethodPost:
+		h.handleCopyPrefix(w, r, parts[1])
+
+	// GET /admin/buckets/{name}/search, .../prefix-stats
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "search" && r.Method == http.MethodGet:
+		h.handleSearchObjects(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "prefix-stats" && r.Method == http.MethodGet:
+		h.handlePrefixStats(w, r, parts[1])
+
+	// Multipart: /admin/buckets/{name}/uploads[/{id}[/parts[/{n}]|/complete]]
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "uploads" && r.Method == http.MethodPost:
+		h.handleCreateUpload(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "uploads" && r.Method == http.MethodGet:
+		h.handleListUploads(w, r, parts[1])
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "uploads" && r.Method == http.MethodDelete:
+		h.handleAbortAllUploads(w, r, parts[1])
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "uploads" && r.Method == http.MethodDelete:
+		h.handleAbortUpload(w, r, parts[1], parts[3])
+	case len(parts) == 5 && parts[0] == "buckets" && parts[2] == "uploads" && parts[4] == "parts" && r.Method == http.MethodGet:
+		h.handleListUploadParts(w, r, parts[1], parts[3])
+	case len(parts) == 5 && parts[0] == "buckets" && parts[2] == "uploads" && parts[4] == "complete" && r.Method == http.MethodPost:
+		h.handleCompleteUpload(w, r, parts[1], parts[3])
+	case len(parts) == 6 && parts[0] == "buckets" && parts[2] == "uploads" && parts[4] == "parts" && r.Method == http.MethodPut:
+		h.handleUploadPart(w, r, parts[1], parts[3], parts[5])
+
+	// PUT/DELETE /admin/buckets/{name}/lifecycle/{id}
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "lifecycle" && r.Method == http.MethodPut:
+		h.handleUpdateLifecycleRule(w, r, parts[1], parts[3])
+	case len(parts) == 4 && parts[0] == "buckets" && parts[2] == "lifecycle" && r.Method == http.MethodDelete:
+		h.handleDeleteLifecycleRule(w, r, parts[1], parts[3])
 
 	// GET /admin/admins
 	case path == "/admins" && r.Method == http.MethodGet:
@@ -533,6 +667,18 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	// DELETE /admin/webhooks/{id}
 	case len(parts) == 2 && parts[0] == "webhooks" && r.Method == http.MethodDelete:
 		h.handleDeleteWebhook(w, r, parts[1])
+
+	// GET /admin/buckets/{name}/object?key=&versionId= (download)
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "object" && r.Method == http.MethodGet:
+		h.handleDownloadObject(w, r, parts[1])
+
+	// PUT /admin/buckets/{name}/object?key= (upload; exempt from the JSON body cap)
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "object" && r.Method == http.MethodPut:
+		h.handleUploadObject(w, r, parts[1])
+
+	// GET /admin/buckets/{name}/versions?key=
+	case len(parts) == 3 && parts[0] == "buckets" && parts[2] == "versions" && r.Method == http.MethodGet:
+		h.handleListKeyVersions(w, r, parts[1])
 
 	// GET /admin/buckets/{name}/objects?prefix=&delimiter=/
 	case len(parts) >= 3 && parts[0] == "buckets" && parts[2] == "objects" && r.Method == http.MethodGet:
@@ -638,7 +784,7 @@ func (h *Handler) handleLogin(w http.ResponseWriter, r *http.Request) {
 	// Success — reset attempts
 	h.resetLoginAttempts(keys...)
 
-	token, expiresAt, err := h.createSession(admin.Username)
+	token, expiresAt, err := h.createSession(admin.Username, r)
 	if err != nil {
 		h.Logger.Error("create session error", "error", err)
 		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal error"})
@@ -666,6 +812,12 @@ func (h *Handler) handleStatus(w http.ResponseWriter, r *http.Request) {
 			"enabled": h.Config.WebDAV.Enabled,
 			"listen":  h.Config.WebDAV.Listen,
 		},
+		"features":       adminFeatures,
+		"uptime_seconds": h.uptimeSeconds(),
+		"tls":            h.statusTLS(),
+		"storage":        h.statusStorage(),
+		"s3":             h.statusS3(),
+		"host":           statusHost(),
 	})
 }
 

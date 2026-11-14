@@ -5,6 +5,7 @@ package lifecycle
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"time"
 
@@ -72,7 +73,7 @@ func RunOnce(ctx context.Context, database *db.DB, store storage.Backend, object
 			total += expireDeleteMarkers(ctx, database, objects, bucket, rule, logger)
 		}
 		if rule.AbortMultipartDays > 0 {
-			total += abortMultipart(ctx, database, store, bucket, rule, logger)
+			total += abortMultipart(ctx, database, objects, bucket, rule, logger)
 		}
 	}
 	if total > 0 {
@@ -159,7 +160,7 @@ func expireDeleteMarkers(ctx context.Context, database *db.DB, objects *service.
 	return cleaned
 }
 
-func abortMultipart(ctx context.Context, database *db.DB, store storage.Backend, bucket *db.Bucket, rule db.LifecycleRule, logger *slog.Logger) int {
+func abortMultipart(ctx context.Context, database *db.DB, objects *service.Objects, bucket *db.Bucket, rule db.LifecycleRule, logger *slog.Logger) int {
 	uploads, err := database.ListStaleMultipartUploadsForBucket(bucket.ID, rule.Prefix, time.Duration(rule.AbortMultipartDays)*24*time.Hour)
 	if err != nil {
 		logger.Error("lifecycle: failed to list multipart uploads", "bucket", rule.BucketName, "error", err)
@@ -170,12 +171,12 @@ func abortMultipart(ctx context.Context, database *db.DB, store storage.Backend,
 		if ctx.Err() != nil {
 			break
 		}
-		if err := store.DeleteMultipartParts(bucket.Name, u.ID); err != nil {
-			logger.Error("lifecycle: failed to delete multipart parts", "uploadId", u.ID, "error", err)
-			continue
-		}
-		if _, err := database.DeleteMultipartUpload(u.ID); err != nil {
-			logger.Error("lifecycle: failed to delete multipart record", "uploadId", u.ID, "error", err)
+		// Through the service so the upload lock is honoured (no abort while
+		// a part upload or completion of the same upload is running).
+		if err := objects.AbortMultipart(bucket, u.ID); err != nil {
+			if !errors.Is(err, service.ErrNoSuchUpload) {
+				logger.Error("lifecycle: failed to abort multipart upload", "uploadId", u.ID, "error", err)
+			}
 			continue
 		}
 		cleaned++

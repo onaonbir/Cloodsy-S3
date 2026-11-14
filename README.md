@@ -37,7 +37,7 @@ All metadata is stored in an embedded SQLite database.
 - **Public-Read Buckets** — Opt-in anonymous object reads (GET/HEAD only) so resized image links work in plain `<img>` tags without signing
 - **Image Optimization on Upload** — Automatically generate a smaller optimized variant alongside each uploaded image (small images inline, large ones in the background); the original is preserved
 - **WebDAV Mounting** — Mount a bucket as a network drive over WebDAV (per-bucket opt-in, Basic Auth maps to bucket credentials)
-- **Admin REST API** — Full management API with session-based authentication for GUI/automation
+- **Admin REST API** — Full management API with session-based authentication for GUI/automation: object upload/download (multipart, resumable), copy/move, search, versions, metadata, lifecycle and webhook management, sessions, logs, metrics and a disk consistency scan. Pairs with [Cloodsy S3 GUI](https://github.com/onaonbir/Cloodsy-S3-GUI)
 - **CORS Support** — Browser-based S3 clients work once you list their origins in `server.cors_origins`
 - **TLS Support** — Optional HTTPS for the S3 API, the Admin API and WebDAV (each listener can carry its own certificate)
 - **Virtual-Host Addressing** — Optional `<bucket>.<domain>` style requests via `server.virtual_host_domains`
@@ -499,7 +499,7 @@ Sessions expire after 8 hours by default (`admin.session_ttl`). Tokens are store
 |--------|----------|-------------|
 | POST | `/admin/login` | Login, returns session token |
 | POST | `/admin/logout` | Logout |
-| GET | `/admin/status` | Server status |
+| GET | `/admin/status` | Server status, feature list, uptime, TLS and storage-disk info |
 | GET | `/admin/admins` | List admin users |
 | POST | `/admin/admins` | Create admin |
 | DELETE | `/admin/admins/{username}` | Delete admin |
@@ -517,15 +517,45 @@ Sessions expire after 8 hours by default (`admin.session_ttl`). Tokens are store
 | GET | `/admin/buckets/{name}/credentials` | List credentials (includes secret keys) |
 | POST | `/admin/buckets/{name}/credentials` | Create credential |
 | DELETE | `/admin/credentials/{accessKey}` | Delete credential |
-| GET | `/admin/buckets/{name}/lifecycle` | List lifecycle rules |
-| POST | `/admin/buckets/{name}/lifecycle` | Create lifecycle rule |
-| DELETE | `/admin/buckets/{name}/lifecycle` | Delete lifecycle rules |
-| GET | `/admin/buckets/{name}/webhooks` | List webhooks |
+| GET | `/admin/buckets/{name}/lifecycle` | List lifecycle rules (`status`, `expiration_days`, `noncurrent_days`, `abort_multipart_days`, `expire_delete_markers`) |
+| POST | `/admin/buckets/{name}/lifecycle` | Create (or replace the same-prefix) lifecycle rule |
+| PUT | `/admin/buckets/{name}/lifecycle/{id}` | Replace one rule |
+| DELETE | `/admin/buckets/{name}/lifecycle/{id}` | Delete one rule |
+| DELETE | `/admin/buckets/{name}/lifecycle[?prefix=]` | Delete the rule for a prefix, or all rules |
+| GET | `/admin/buckets/{name}/webhooks` | List webhooks (`has_secret`; the secret is never returned) |
 | POST | `/admin/buckets/{name}/webhooks` | Create webhook |
+| PUT | `/admin/webhooks/{id}` | Update webhook (omit `secret` to keep it) |
 | DELETE | `/admin/webhooks/{id}` | Delete webhook |
+| GET | `/admin/webhooks/{id}/deliveries?limit=50` | Recorded delivery attempts, newest first (last 200 kept) |
+| POST | `/admin/webhooks/{id}/test` | Send a signed `s3:TestEvent` synchronously |
 | GET | `/admin/buckets/{name}/objects` | List objects (prefix/delimiter) |
 | DELETE | `/admin/buckets/{name}/objects/{key}` | Delete object |
 | POST | `/admin/buckets/{name}/objects/delete-prefix` | Delete folder |
+| POST | `/admin/buckets/{name}/objects/copy` | Server-side copy or move of one object (`source_key`, `dest_bucket`, `dest_key`, `move`) |
+| POST | `/admin/buckets/{name}/objects/copy-prefix` | Copy or move a folder (`source_prefix`, `dest_bucket`, `dest_prefix`, `move`) |
+| GET/HEAD | `/admin/buckets/{name}/object?key=<key>[&versionId=<v>][&inline=1]` | Download object bytes (streamed; single `Range` → 206; `inline=1` for previews) |
+| PUT | `/admin/buckets/{name}/object?key=<key>` | Upload object; raw body, `Content-Type` is stored |
+| GET | `/admin/buckets/{name}/object/info?key=<key>` | Object details: metadata, on-disk paths, image variant, all versions |
+| PUT | `/admin/buckets/{name}/object/meta?key=<key>` | Replace content type and user metadata (S3 copy-onto-itself with `REPLACE`) |
+| GET | `/admin/buckets/{name}/versions?key=<key>` | List versions and delete markers of one key, newest first |
+| GET | `/admin/buckets/{name}/search?q=&prefix=&marker=&max-keys=` | Recursive, case-insensitive key search |
+| GET | `/admin/buckets/{name}/prefix-stats?prefix=` | Object count and bytes under a prefix |
+| POST | `/admin/buckets/{name}/uploads?key=<key>` | Start a multipart upload (`Content-Type` header is stored) |
+| PUT | `/admin/buckets/{name}/uploads/{id}/parts/{n}` | Upload part `n` (1–10000); raw body |
+| GET | `/admin/buckets/{name}/uploads/{id}/parts` | List uploaded parts (resume) |
+| POST | `/admin/buckets/{name}/uploads/{id}/complete` | Assemble the listed parts into the object |
+| DELETE | `/admin/buckets/{name}/uploads/{id}` | Abort one upload |
+| GET | `/admin/buckets/{name}/uploads` | List every incomplete multipart upload (including S3-client ones) |
+| DELETE | `/admin/buckets/{name}/uploads[?older_than_days=N]` | Abort all (or older) incomplete uploads |
+| POST | `/admin/maintenance/scan` | Read-only check: orphan bucket dirs, missing and untracked data files |
+| POST | `/admin/maintenance/orphan-dirs/delete` | Delete orphan dirs reported by a fresh scan (`paths`) |
+| GET | `/admin/sessions` | Live admin sessions of all users |
+| DELETE | `/admin/sessions/{id}` | Revoke a session (your own = logout) |
+| GET | `/admin/logs?since_id=&level=&limit=&q=` | Recent server log records (in-memory, last 2000) |
+| GET | `/admin/config` | Effective configuration, secrets masked |
+| GET | `/admin/metrics` | S3 request counters and a per-minute series for the last hour |
+
+Uploads (single and multipart), copies, moves and metadata edits go through the same object service as the S3 API: bucket quota (HTTP 413 `{"error":"quota exceeded"}`), versioning, image optimization and webhooks behave identically. A single-request upload is limited to 5 GB; larger files use the multipart routes (5 MiB minimum for every part except the last, enforced at completion as on S3). Object and part uploads are the only admin endpoints without the 1 MB JSON body cap. A key ending in `/` with an empty body creates a folder marker. `GET /admin/status` lists the optional endpoints a server supports in `features` so clients can detect them, plus `s3` (listen, tls, region, virtual-host domains) and `host` (os, hostname, WSL distro).
 
 ## Configuration
 

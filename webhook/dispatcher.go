@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -80,6 +81,11 @@ type Dispatcher struct {
 	done    chan struct{}
 	mu      sync.RWMutex
 	closed  bool
+
+	// Delivery log: attempts are handed to a single recorder goroutine so a
+	// slow database never delays a delivery.
+	records      chan db.WebhookDelivery
+	recorderDone chan struct{}
 }
 
 // NewDispatcher creates a new webhook dispatcher.
@@ -100,9 +106,28 @@ func NewDispatcher(database *db.DB, workers int, logger *slog.Logger) *Dispatche
 		logger: logger,
 		region: "us-east-1",
 		done:   make(chan struct{}),
+
+		records:      make(chan db.WebhookDelivery, 1024),
+		recorderDone: make(chan struct{}),
+	}
+	if database != nil {
+		go d.recorder()
+	} else {
+		close(d.recorderDone)
 	}
 	for i := 0; i < workers; i++ {
 		go d.worker()
+	}
+	return d
+}
+
+// NewSender returns a worker-less dispatcher usable only for SendTest (when
+// no running dispatcher is available, e.g. an admin-only process).
+func NewSender(database *db.DB, region string, logger *slog.Logger) *Dispatcher {
+	d := NewDispatcher(database, 1, logger)
+	d.Stop()
+	if region != "" {
+		d.region = region
 	}
 	return d
 }
@@ -138,6 +163,9 @@ func (d *Dispatcher) Stop() {
 	for i := 0; i < d.workers; i++ {
 		<-d.done
 	}
+	// Workers are gone, so nothing sends on records any more.
+	close(d.records)
+	<-d.recorderDone
 }
 
 func (d *Dispatcher) worker() {
@@ -185,7 +213,8 @@ func newDeliveryID() string {
 	return hex.EncodeToString(b)
 }
 
-func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
+// buildPayload renders the S3-compatible event body for one hook.
+func (d *Dispatcher) buildPayload(hook db.BucketWebhook, event Event) ([]byte, error) {
 	payload := s3EventPayload{
 		Records: []s3Record{{
 			EventVersion: "2.1",
@@ -208,8 +237,63 @@ func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 			},
 		}},
 	}
+	return json.Marshal(payload)
+}
 
-	body, err := json.Marshal(payload)
+// DeliveryResult describes one delivery attempt.
+type DeliveryResult struct {
+	StatusCode int    // 0 when no HTTP response was received
+	Error      string // "" on a 2xx response
+	Duration   time.Duration
+}
+
+// OK reports a 2xx response.
+func (r DeliveryResult) OK() bool { return r.Error == "" && r.StatusCode >= 200 && r.StatusCode < 300 }
+
+var errInvalidRequest = "invalid request: "
+
+// send performs one signed POST of body to the hook.
+func (d *Dispatcher) send(hook db.BucketWebhook, event Event, body []byte, deliveryID string) DeliveryResult {
+	start := time.Now()
+	req, err := http.NewRequest("POST", hook.URL, bytes.NewReader(body))
+	if err != nil {
+		return DeliveryResult{Error: errInvalidRequest + err.Error(), Duration: time.Since(start)}
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "Cloodsy-S3-Webhook/1.0")
+	req.Header.Set("X-Cloodsy-Delivery", deliveryID)
+	req.Header.Set("X-Cloodsy-Event", event.EventType)
+	req.Header.Set("X-Cloodsy-Timestamp", strconv.FormatInt(event.Timestamp.Unix(), 10))
+
+	// HMAC signing over the body (X-Cloodsy-Signature) plus a replay-resistant
+	// variant that also covers the timestamp (X-Cloodsy-Signature-256).
+	if hook.Secret != "" {
+		mac := hmac.New(sha256.New, []byte(hook.Secret))
+		mac.Write(body)
+		req.Header.Set("X-Cloodsy-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
+
+		mac2 := hmac.New(sha256.New, []byte(hook.Secret))
+		mac2.Write([]byte(strconv.FormatInt(event.Timestamp.Unix(), 10)))
+		mac2.Write([]byte("."))
+		mac2.Write(body)
+		req.Header.Set("X-Cloodsy-Signature-256", "t="+strconv.FormatInt(event.Timestamp.Unix(), 10)+",v1="+hex.EncodeToString(mac2.Sum(nil)))
+	}
+
+	resp, err := d.client.Do(req)
+	if err != nil {
+		return DeliveryResult{Error: err.Error(), Duration: time.Since(start)}
+	}
+	io.Copy(io.Discard, io.LimitReader(resp.Body, 64<<10))
+	resp.Body.Close()
+	res := DeliveryResult{StatusCode: resp.StatusCode, Duration: time.Since(start)}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		res.Error = fmt.Sprintf("unexpected status %d", resp.StatusCode)
+	}
+	return res
+}
+
+func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
+	body, err := d.buildPayload(hook, event)
 	if err != nil {
 		d.logger.Error("failed to marshal webhook payload", "error", err)
 		return
@@ -223,46 +307,93 @@ func (d *Dispatcher) deliver(hook db.BucketWebhook, event Event) {
 			time.Sleep(backoff)
 			backoff *= 2
 		}
-
-		req, err := http.NewRequest("POST", hook.URL, bytes.NewReader(body))
-		if err != nil {
-			d.logger.Error("failed to create webhook request", "url", hook.URL, "error", err)
+		res := d.send(hook, event, body, deliveryID)
+		d.record(hook, event, res, attempt+1)
+		if res.OK() {
 			return
 		}
-		req.Header.Set("Content-Type", "application/json")
-		req.Header.Set("User-Agent", "Cloodsy-S3-Webhook/1.0")
-		req.Header.Set("X-Cloodsy-Delivery", deliveryID)
-		req.Header.Set("X-Cloodsy-Event", event.EventType)
-		req.Header.Set("X-Cloodsy-Timestamp", strconv.FormatInt(event.Timestamp.Unix(), 10))
-
-		// HMAC signing over the body (X-Cloodsy-Signature) plus a replay-resistant
-		// variant that also covers the timestamp (X-Cloodsy-Signature-256).
-		if hook.Secret != "" {
-			mac := hmac.New(sha256.New, []byte(hook.Secret))
-			mac.Write(body)
-			req.Header.Set("X-Cloodsy-Signature", "sha256="+hex.EncodeToString(mac.Sum(nil)))
-
-			mac2 := hmac.New(sha256.New, []byte(hook.Secret))
-			mac2.Write([]byte(strconv.FormatInt(event.Timestamp.Unix(), 10)))
-			mac2.Write([]byte("."))
-			mac2.Write(body)
-			req.Header.Set("X-Cloodsy-Signature-256", "t="+strconv.FormatInt(event.Timestamp.Unix(), 10)+",v1="+hex.EncodeToString(mac2.Sum(nil)))
+		switch {
+		case res.StatusCode == 0 && strings.HasPrefix(res.Error, errInvalidRequest):
+			d.logger.Error("failed to create webhook request", "url", hook.URL, "error", res.Error)
+			return
+		case res.StatusCode == 0:
+			d.logger.Warn("webhook delivery failed", "url", hook.URL, "attempt", attempt+1, "error", res.Error)
+		default:
+			d.logger.Warn("webhook non-2xx response", "url", hook.URL, "status", res.StatusCode, "attempt", attempt+1)
 		}
-
-		resp, err := d.client.Do(req)
-		if err != nil {
-			d.logger.Warn("webhook delivery failed", "url", hook.URL, "attempt", attempt+1, "error", err)
-			continue
-		}
-		resp.Body.Close()
-
-		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-			return // success
-		}
-		d.logger.Warn("webhook non-2xx response", "url", hook.URL, "status", resp.StatusCode, "attempt", attempt+1)
 	}
 
 	d.logger.Error("webhook delivery failed after retries", "url", hook.URL, "bucket", hook.BucketName)
+}
+
+// TestEventType is the event name of synthetic test deliveries.
+const TestEventType = "s3:TestEvent"
+
+// SendTest synchronously delivers one synthetic s3:TestEvent (key
+// "cloodsy-test") to hook with the same payload shape, signing and timeout as
+// real events, records it in the delivery log and returns the outcome. No
+// retries are made.
+func (d *Dispatcher) SendTest(hook db.BucketWebhook) DeliveryResult {
+	event := Event{
+		BucketName: hook.BucketName,
+		EventType:  TestEventType,
+		Key:        "cloodsy-test",
+		Timestamp:  time.Now().UTC(),
+	}
+	body, err := d.buildPayload(hook, event)
+	if err != nil {
+		return DeliveryResult{Error: err.Error()}
+	}
+	res := d.send(hook, event, body, newDeliveryID())
+	if d.db != nil {
+		if err := d.db.InsertWebhookDelivery(deliveryRecord(hook, event, res, 1)); err != nil {
+			d.logger.Warn("failed to record webhook delivery", "webhook", hook.ID, "error", err)
+		}
+	}
+	return res
+}
+
+func deliveryRecord(hook db.BucketWebhook, event Event, res DeliveryResult, attempt int) db.WebhookDelivery {
+	errMsg := res.Error
+	if len(errMsg) > 512 {
+		errMsg = errMsg[:512]
+	}
+	key := event.Key
+	if len(key) > 1024 {
+		key = key[:1024]
+	}
+	return db.WebhookDelivery{
+		WebhookID:  hook.ID,
+		EventType:  event.EventType,
+		ObjectKey:  key,
+		StatusCode: res.StatusCode,
+		Error:      errMsg,
+		DurationMs: res.Duration.Milliseconds(),
+		Attempt:    attempt,
+		CreatedAt:  time.Now().UTC(),
+	}
+}
+
+// record queues a delivery attempt for the recorder goroutine. It never
+// blocks the delivery: when the recorder falls behind, records are dropped.
+func (d *Dispatcher) record(hook db.BucketWebhook, event Event, res DeliveryResult, attempt int) {
+	if d.db == nil {
+		return
+	}
+	select {
+	case d.records <- deliveryRecord(hook, event, res, attempt):
+	default:
+	}
+}
+
+// recorder persists delivery attempts off the delivery path.
+func (d *Dispatcher) recorder() {
+	defer close(d.recorderDone)
+	for rec := range d.records {
+		if err := d.db.InsertWebhookDelivery(rec); err != nil {
+			d.logger.Warn("failed to record webhook delivery", "webhook", rec.WebhookID, "error", err)
+		}
+	}
 }
 
 // ValidateURL checks a webhook destination. Only http/https are accepted.

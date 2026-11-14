@@ -83,6 +83,14 @@ func (fs *FileSystem) bucketBasePath(bucket string) string {
 // that a bucket name can never be "." / ".." or contain a path separator.
 var validBucketDirName = regexp.MustCompile(`^[a-z0-9][a-z0-9\-]{1,61}[a-z0-9]$`)
 
+// IsValidBucketDirName reports whether name follows the bucket naming rules
+// (and can therefore be a bucket directory).
+func IsValidBucketDirName(name string) bool { return validBucketDirName.MatchString(name) }
+
+// SiblingSuffixes lists the suffixes of the hidden per-bucket trees that live
+// next to a bucket directory (".<bucket>-<suffix>").
+var SiblingSuffixes = []string{"multipart", "cache"}
+
 // bucketRoot returns the absolute directory holding a bucket's objects.
 func (fs *FileSystem) bucketRoot(bucket string) (string, error) {
 	if !validBucketDirName.MatchString(bucket) {
@@ -150,6 +158,34 @@ func (fs *FileSystem) versionedObjectPath(bucket, key, versionID string) (string
 		return "", err
 	}
 	return p + versionSep + versionID + safeExt, nil
+}
+
+// ObjectPath returns the absolute on-disk path of an object version. An empty
+// or "null" version id addresses the unversioned slot. It is the same path
+// the read/write functions use, for diagnostics (admin object info,
+// maintenance scans).
+func (fs *FileSystem) ObjectPath(bucket, key, versionID string) (string, error) {
+	if versionID != "" && versionID != "null" {
+		return fs.versionedObjectPath(bucket, key, versionID)
+	}
+	return fs.objectPath(bucket, key)
+}
+
+// BucketPath returns the absolute directory holding a bucket's objects.
+func (fs *FileSystem) BucketPath(bucket string) (string, error) {
+	return fs.bucketRoot(bucket)
+}
+
+// VariantPath returns the absolute path of a cached derivative.
+func (fs *FileSystem) VariantPath(bucket, cacheKey string) (string, error) {
+	return fs.variantPath(bucket, cacheKey)
+}
+
+// IsObjectDataFile reports whether a file name (base name) inside a bucket
+// directory is an object data file written by this package (as opposed to a
+// temp file or a foreign file).
+func IsObjectDataFile(name string) bool {
+	return strings.HasSuffix(name, safeExt) && !strings.HasPrefix(name, tmpPrefix)
 }
 
 // LegacyObjectPath returns the path an object was stored at before the

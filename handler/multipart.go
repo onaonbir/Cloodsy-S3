@@ -1,9 +1,9 @@
 package handler
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -121,7 +121,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	size, etag, err := h.Storage.PutMultipartPart(bucketName, uploadID, partNumber, body, storage.PutOptions{
+	part, err := h.Objects.PutPart(bucket, uploadID, partNumber, body, storage.PutOptions{
 		MaxSize: maxPartSize,
 		Verify:  checker.verify,
 	})
@@ -129,14 +129,7 @@ func (h *Handler) UploadPart(w http.ResponseWriter, r *http.Request) {
 		h.writeServiceError(w, r, err, "failed to write part")
 		return
 	}
-
-	part := &db.MultipartPart{UploadID: uploadID, PartNumber: partNumber, Size: size, ETag: etag}
-	if err := h.DB.PutMultipartPart(part); err != nil {
-		h.Storage.DeleteMultipartPart(bucketName, uploadID, partNumber)
-		h.Logger.Error("failed to save part metadata", "error", err)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
+	etag := part.ETag
 
 	w.Header().Set("ETag", etag)
 	if checker.checksumAlgo != "" && checker.checksumHash != nil {
@@ -187,86 +180,16 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	dbParts, err := h.DB.ListMultipartParts(uploadID)
-	if err != nil {
-		h.Logger.Error("db error", "error", err)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
-	partMap := make(map[int]db.MultipartPart, len(dbParts))
-	for _, p := range dbParts {
-		partMap[p.PartNumber] = p
-	}
-
-	// Validate in S3 order: part order, then part existence/ETag, then sizes.
-	prevPartNum := 0
-	for _, p := range completeReq.Parts {
-		if p.PartNumber <= prevPartNum {
-			s3err.WriteError(w, r, s3err.ErrInvalidPartOrder)
-			return
-		}
-		prevPartNum = p.PartNumber
-	}
-	var partNumbers []int
-	var expectedSize int64
+	parts := make([]service.CompletedPart, len(completeReq.Parts))
 	for i, p := range completeReq.Parts {
-		dbPart, exists := partMap[p.PartNumber]
-		if !exists || strings.Trim(p.ETag, "\"") != strings.Trim(dbPart.ETag, "\"") {
-			s3err.WriteError(w, r, s3err.ErrInvalidPart)
-			return
-		}
-		if i < len(completeReq.Parts)-1 && dbPart.Size < minPartSize {
-			s3err.WriteError(w, r, s3err.ErrEntityTooSmall)
-			return
-		}
-		expectedSize += dbPart.Size
-		if expectedSize < 0 || expectedSize > maxMultipartSize {
-			s3err.WriteError(w, r, s3err.ErrEntityTooLarge)
-			return
-		}
-		partNumbers = append(partNumbers, p.PartNumber)
+		parts[i] = service.CompletedPart{PartNumber: p.PartNumber, ETag: p.ETag}
 	}
-
-	// Serialize with other writers of this key and check quota before the
-	// expensive assembly.
-	unlockKey := h.Objects.Lock(bucket.ID, key)
-	defer unlockKey()
-
-	if err := h.checkQuotaFor(bucket, key, expectedSize); err != nil {
-		h.writeServiceError(w, r, err, "quota")
-		return
-	}
-
-	versionID := service.VersionIDForPut(bucket)
-	opts := storage.PutOptions{
-		MaxSize: maxMultipartSize,
-		Verify: func(size int64, _ []byte) error {
-			return h.checkQuotaFor(bucket, key, size)
-		},
-	}
-	var totalSize int64
-	var etag string
-	if service.IsRealVersion(versionID) {
-		totalSize, etag, err = h.Storage.AssembleMultipartPartsVersioned(bucketName, key, versionID, uploadID, partNumbers, opts)
-	} else {
-		totalSize, etag, err = h.Storage.AssembleMultipartParts(bucketName, key, uploadID, partNumbers, opts)
-	}
+	res, err := h.Objects.CompleteMultipart(bucket, upload, key, parts)
 	if err != nil {
-		h.writeServiceError(w, r, err, "failed to assemble parts")
+		h.writeServiceError(w, r, err, "failed to complete multipart upload")
 		return
 	}
-
-	res, err := h.Objects.Commit(bucket, key, versionID, totalSize, etag, upload.ContentType, upload.Metadata, "s3:ObjectCreated:CompleteMultipartUpload")
-	if err != nil {
-		h.Logger.Error("failed to save object metadata", "error", err)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
-
-	if err := h.Storage.DeleteMultipartParts(bucketName, uploadID); err != nil {
-		h.Logger.Error("failed to clean up multipart parts", "uploadId", uploadID, "error", err)
-	}
-	h.DB.DeleteMultipartUpload(uploadID)
+	etag := res.ETag
 
 	if res.VersionID != "" {
 		w.Header().Set("x-amz-version-id", res.VersionID)
@@ -283,27 +206,6 @@ func (h *Handler) CompleteMultipartUpload(w http.ResponseWriter, r *http.Request
 		Key:      key,
 		ETag:     etag,
 	})
-}
-
-// checkQuotaFor mirrors the service quota rule for callers that assemble
-// bytes themselves.
-func (h *Handler) checkQuotaFor(bucket *db.Bucket, key string, additional int64) error {
-	if bucket.QuotaBytes <= 0 {
-		return nil
-	}
-	usage, err := h.DB.GetBucketUsage(bucket.ID)
-	if err != nil {
-		return err
-	}
-	if bucket.Versioning != "Enabled" {
-		if cur, err := h.DB.GetObjectMeta(bucket.ID, key); err == nil && cur != nil && !cur.IsDeleteMarker {
-			usage -= cur.Size
-		}
-	}
-	if usage+additional > bucket.QuotaBytes {
-		return service.ErrQuotaExceeded
-	}
-	return nil
 }
 
 // AbortMultipartUpload handles DELETE /<bucket>/<key>?uploadId=X
@@ -327,7 +229,12 @@ func (h *Handler) AbortMultipartUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	h.Storage.DeleteMultipartParts(bucketName, uploadID)
-	h.DB.DeleteMultipartUpload(uploadID)
+	if err := h.Objects.AbortMultipart(bucket, uploadID); err != nil {
+		if errors.Is(err, service.ErrNoSuchUpload) {
+			s3err.WriteError(w, r, s3err.ErrNoSuchUpload)
+			return
+		}
+		h.Logger.Error("failed to abort multipart upload", "uploadId", uploadID, "error", err)
+	}
 	w.WriteHeader(http.StatusNoContent)
 }

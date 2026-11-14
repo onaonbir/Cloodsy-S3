@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/onaonbir/Cloodsy-S3/db"
+	"github.com/onaonbir/Cloodsy-S3/httpx"
 	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
 	"github.com/onaonbir/Cloodsy-S3/service"
@@ -389,47 +390,7 @@ func variantETagFromKey(cacheKey, fallback string) string {
 // requests and unparsable ranges return ok=false (S3 then serves the whole
 // object). An unsatisfiable range returns ok=false with start=-1.
 func parseRange(rangeHeader string, size int64) (start, end int64, ok bool) {
-	spec, found := strings.CutPrefix(strings.TrimSpace(rangeHeader), "bytes=")
-	if !found || strings.Contains(spec, ",") {
-		return 0, 0, false
-	}
-	first, last, found := strings.Cut(spec, "-")
-	if !found {
-		return 0, 0, false
-	}
-	first, last = strings.TrimSpace(first), strings.TrimSpace(last)
-	if first == "" {
-		// suffix range: -N means last N bytes
-		n, err := strconv.ParseInt(last, 10, 64)
-		if err != nil || n <= 0 {
-			return -1, 0, false
-		}
-		if size == 0 {
-			return -1, 0, false
-		}
-		if n > size {
-			n = size
-		}
-		return size - n, size - 1, true
-	}
-	s, err := strconv.ParseInt(first, 10, 64)
-	if err != nil || s < 0 {
-		return 0, 0, false
-	}
-	e := size - 1
-	if last != "" {
-		e, err = strconv.ParseInt(last, 10, 64)
-		if err != nil || e < s {
-			return 0, 0, false
-		}
-		if e >= size {
-			e = size - 1
-		}
-	}
-	if s >= size {
-		return -1, 0, false
-	}
-	return s, e, true
+	return httpx.ParseRange(rangeHeader, size)
 }
 
 func ifRangeMatches(ifRange string, meta *db.ObjectMeta) bool {
@@ -574,23 +535,14 @@ func (h *Handler) copyObject(w http.ResponseWriter, r *http.Request, cred *db.Bu
 		}
 	}
 
-	reader, err := h.Objects.Open(srcBucket, srcMeta)
-	if err != nil {
-		h.Logger.Error("failed to read source object", "error", err)
-		s3err.WriteError(w, r, s3err.ErrInternalError)
-		return
-	}
-	defer reader.Close()
-
-	res, err := h.Objects.Put(service.PutInput{
-		Bucket:       destBucket,
-		Key:          destKey,
-		Body:         reader,
-		ContentType:  contentType,
-		Metadata:     metadata,
-		DeclaredSize: srcMeta.Size,
-		MaxSize:      maxObjectSize,
-		EventType:    "s3:ObjectCreated:Copy",
+	res, err := h.Objects.Copy(service.CopyInput{
+		SrcBucket:   srcBucket,
+		Src:         srcMeta,
+		DstBucket:   destBucket,
+		DstKey:      destKey,
+		ContentType: contentType,
+		Metadata:    metadata,
+		MaxSize:     maxObjectSize,
 	})
 	if err != nil {
 		h.writeServiceError(w, r, err, "failed to write dest object")

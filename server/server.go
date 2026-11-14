@@ -18,6 +18,7 @@ import (
 	"github.com/onaonbir/Cloodsy-S3/httpx"
 	imageutil "github.com/onaonbir/Cloodsy-S3/image"
 	"github.com/onaonbir/Cloodsy-S3/lifecycle"
+	"github.com/onaonbir/Cloodsy-S3/metrics"
 	"github.com/onaonbir/Cloodsy-S3/storage"
 	"github.com/onaonbir/Cloodsy-S3/webhook"
 )
@@ -47,6 +48,7 @@ func RunContext(parent context.Context, cfg *config.Config, h *handler.Handler, 
 	var root http.Handler = NewRouter(h, logger)
 	root = httpx.ProgressTimeout(root, idle)
 	root = httpx.Recover(root, logger)
+	root = metrics.Middleware(root, metrics.S3)
 
 	srv := &http.Server{
 		Addr:              cfg.Server.Listen,
@@ -66,7 +68,7 @@ func RunContext(parent context.Context, cfg *config.Config, h *handler.Handler, 
 	defer stop()
 
 	maxAge := config.Duration(cfg.Storage.MultipartMaxAge, 24*time.Hour)
-	go runMultipartCleanup(ctx, h.DB, h.Storage, maxAge, logger)
+	go runMultipartCleanup(ctx, h.DB, h.Storage, h.Objects.LockUpload, maxAge, logger)
 
 	lifecycleInterval := config.Duration(cfg.Storage.LifecycleInterval, time.Hour)
 	go lifecycle.StartCleaner(ctx, h.DB, h.Storage, h.Objects, lifecycleInterval, logger)
@@ -158,23 +160,25 @@ type multipartCleaner interface {
 }
 
 // runMultipartCleanup periodically removes stale multipart uploads.
-func runMultipartCleanup(ctx context.Context, database *db.DB, store multipartCleaner, maxAge time.Duration, logger *slog.Logger) {
+// lockUpload is service.Objects.LockUpload: a stale upload is never removed
+// while a part upload or completion of it is in flight.
+func runMultipartCleanup(ctx context.Context, database *db.DB, store multipartCleaner, lockUpload func(string) func(), maxAge time.Duration, logger *slog.Logger) {
 	ticker := time.NewTicker(1 * time.Hour)
 	defer ticker.Stop()
 
-	cleanStaleUploads(database, store, maxAge, logger)
+	cleanStaleUploads(database, store, lockUpload, maxAge, logger)
 
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
-			cleanStaleUploads(database, store, maxAge, logger)
+			cleanStaleUploads(database, store, lockUpload, maxAge, logger)
 		}
 	}
 }
 
-func cleanStaleUploads(database *db.DB, store multipartCleaner, maxAge time.Duration, logger *slog.Logger) {
+func cleanStaleUploads(database *db.DB, store multipartCleaner, lockUpload func(string) func(), maxAge time.Duration, logger *slog.Logger) {
 	uploads, err := database.ListStaleMultipartUploads(maxAge)
 	if err != nil {
 		logger.Error("failed to list stale multipart uploads", "error", err)
@@ -187,33 +191,45 @@ func cleanStaleUploads(database *db.DB, store multipartCleaner, maxAge time.Dura
 	bucketNames := make(map[int64]string)
 	cleaned := 0
 	for _, u := range uploads {
-		name, ok := bucketNames[u.BucketID]
-		if !ok {
-			n, err := database.GetBucketNameByID(u.BucketID)
-			if err != nil {
-				logger.Error("failed to resolve bucket for stale upload", "uploadId", u.ID, "bucketId", u.BucketID, "error", err)
-				continue
-			}
-			if n == "" {
-				if _, err := database.DeleteMultipartUpload(u.ID); err != nil {
-					logger.Error("failed to delete stale multipart record", "uploadId", u.ID, "error", err)
-					continue
-				}
-				cleaned++
-				continue
-			}
-			bucketNames[u.BucketID] = n
-			name = n
+		if cleanStaleUpload(database, store, lockUpload, u, bucketNames, logger) {
+			cleaned++
 		}
-		if err := store.DeleteMultipartParts(name, u.ID); err != nil {
-			logger.Error("failed to delete stale multipart parts", "uploadId", u.ID, "bucket", name, "error", err)
-			continue
-		}
-		if _, err := database.DeleteMultipartUpload(u.ID); err != nil {
-			logger.Error("failed to delete stale multipart record", "uploadId", u.ID, "error", err)
-			continue
-		}
-		cleaned++
 	}
 	logger.Info("cleaned up stale multipart uploads", "count", cleaned, "maxAge", maxAge.String())
+}
+
+// cleanStaleUpload removes one stale upload under its upload lock and reports
+// whether it was removed.
+func cleanStaleUpload(database *db.DB, store multipartCleaner, lockUpload func(string) func(), u db.MultipartUpload, bucketNames map[int64]string, logger *slog.Logger) bool {
+	unlock := lockUpload(u.ID)
+	defer unlock()
+	if cur, err := database.GetMultipartUpload(u.ID); err != nil || cur == nil {
+		return false // completed or aborted meanwhile
+	}
+	name, ok := bucketNames[u.BucketID]
+	if !ok {
+		n, err := database.GetBucketNameByID(u.BucketID)
+		if err != nil {
+			logger.Error("failed to resolve bucket for stale upload", "uploadId", u.ID, "bucketId", u.BucketID, "error", err)
+			return false
+		}
+		if n == "" {
+			if _, err := database.DeleteMultipartUpload(u.ID); err != nil {
+				logger.Error("failed to delete stale multipart record", "uploadId", u.ID, "error", err)
+				return false
+			}
+			return true
+		}
+		bucketNames[u.BucketID] = n
+		name = n
+	}
+	if err := store.DeleteMultipartParts(name, u.ID); err != nil {
+		logger.Error("failed to delete stale multipart parts", "uploadId", u.ID, "bucket", name, "error", err)
+		return false
+	}
+	if _, err := database.DeleteMultipartUpload(u.ID); err != nil {
+		logger.Error("failed to delete stale multipart record", "uploadId", u.ID, "error", err)
+		return false
+	}
+	return true
 }
