@@ -8,6 +8,107 @@ All notable changes to Cloodsy S3 are documented here. The format follows
 
 Nothing yet.
 
+## [1.4.0] - 2026-11-14
+
+### Added
+
+Admin API extensions for the Cloodsy S3 GUI 2.0. Every new route requires an
+admin session; `GET /admin/status` lists them in `features` so clients can
+detect what a server supports.
+
+- **Object transfer**: `GET`/`HEAD /admin/buckets/{name}/object?key=` streams
+  an object (optional `versionId`, single `Range` requests with `206`/`416`,
+  `inline=1` for previews; `Content-Security-Policy: sandbox` and an RFC 6266
+  `Content-Disposition`). `PUT` on the same route uploads the raw request body
+  through the same object service as S3 `PutObject` (quota → `413`,
+  versioning, image optimization, webhooks, 5 GB limit; an empty body on a
+  key ending in `/` creates a folder marker).
+- **Multipart upload** for files over 5 GB and resumable uploads: create,
+  upload part, list parts, complete and abort, plus listing every incomplete
+  upload of a bucket (including those started by S3 clients) and aborting
+  them in bulk (`older_than_days`).
+- **Object details**: `GET /admin/buckets/{name}/object/info` (content type,
+  user metadata, the data file of every version on disk, the optimized image
+  variant) and `GET /admin/buckets/{name}/versions` (all versions and delete
+  markers of a key).
+- **Copy, move and rename**: `POST /admin/buckets/{name}/objects/copy` and
+  `.../objects/copy-prefix` (folders) copy server-side through the S3
+  `CopyObject` path, across buckets if needed; `move` then deletes the source.
+- **Metadata editing**: `PUT /admin/buckets/{name}/object/meta` replaces the
+  content type and user metadata (S3 `CopyObject` onto itself with
+  `MetadataDirective=REPLACE`).
+- **Search and folder size**: `GET /admin/buckets/{name}/search` (recursive,
+  case-insensitive, paginated in SQL) and `GET /admin/buckets/{name}/prefix-stats`.
+- **Lifecycle rules**: the Admin API now exposes `status`, `noncurrent_days`,
+  `abort_multipart_days` and `expire_delete_markers` (validated like
+  `PutBucketLifecycle`) and edits or deletes single rules by id.
+- **Webhooks**: every delivery attempt is recorded (newest 200 per webhook,
+  written off the delivery path); new endpoints list deliveries, send a signed
+  `s3:TestEvent`, and update a webhook. Listings report `has_secret`; the
+  secret itself is never returned.
+- **Maintenance scan**: `POST /admin/maintenance/scan` reports orphan bucket
+  directories, objects whose data file is missing and data files no object
+  points to (read-only, bounded). `POST /admin/maintenance/orphan-dirs/delete`
+  removes only directories a fresh server-side scan reports as orphans.
+- **Sessions, logs, config, metrics**: list and revoke admin sessions (with
+  IP, user agent and last activity); the last 2000 log records from an
+  in-memory ring; the effective configuration with secrets masked; S3 request,
+  error and byte counters with a per-minute series for the last hour.
+- **Status**: `GET /admin/status` also reports `uptime_seconds`, `tls`,
+  `storage` (data directory and free/total disk space), `s3` (listen address,
+  TLS, region, virtual-host domains) and `host` (OS, hostname, WSL distro).
+- Admin CORS responses expose the download headers (`Content-Disposition`,
+  `Content-Length`, `Content-Range`, `Accept-Ranges`, `ETag`, `Last-Modified`,
+  `X-Version-Id`).
+
+### Changed
+
+- S3 `CopyObject`, multipart upload/completion/abort and user-metadata
+  validation moved into the shared object service, so the S3 API and the
+  Admin API run the same code.
+- Database migration 3 adds the `webhook_deliveries` table. It only adds a
+  table, so downgrading to 1.3.x keeps working.
+- `golang.org/x/sys` is now a direct dependency (Windows disk-space query).
+- Built with Go 1.27.4 (`go` directive raised from 1.27.2).
+- `modernc.org/sqlite` 1.62.0 (SQLite 3.54.1), `golang.org/x/net` 0.62.0,
+  `pterm` 0.12.84 and `softprops/action-gh-release` 3.0.4.
+
+### Security
+
+- Object info, the maintenance scan and `GET /admin/config` reveal absolute
+  server paths to admins. Keep the Admin API behind TLS or on a trusted
+  network (see `admin.tls`).
+- Orphan detection is content-based: a directory is reported (and can be
+  deleted) only if it holds nothing but directories and the files the server
+  writes there, with no symlinks or special files, and it is re-checked right
+  before deletion. Storage roots, live bucket trees and the directories of the
+  database, ACME cache, config file and TLS certificates/keys are never
+  candidates (compared case-insensitively on Windows and macOS). A shared
+  `storage_dir` no longer exposes other applications' directories.
+- Admin moves hold the source and destination key locks across copy and
+  delete, refuse a source that changed since it was looked up (409), and
+  delete only the versions that existed when the copy started; a version
+  written by an S3 client meanwhile is kept.
+- Copies and moves within a bucket between keys or prefixes that differ only
+  in letter case are refused (409): on case-insensitive filesystems they are
+  the same file.
+- The in-memory log ring caps messages at 4 KiB, like attribute values.
+- Presigned URL masking in the request log decodes parameter names, so
+  percent-encoded or differently cased `X-Amz-Signature`, `X-Amz-Credential`
+  and `X-Amz-Security-Token` values are masked too; an unparseable query is
+  masked whole.
+- Maintenance scans and orphan deletes run one at a time (409 when busy),
+  prefix copies take the bucket's busy lock, and both stop when the client
+  disconnects.
+- A multipart part upload can no longer race an abort or completion of the
+  same upload: parts share a per-upload lock (parallel parts still run in
+  parallel), abort/complete take it exclusively, and a part for an upload that
+  is gone fails with `NoSuchUpload`. Lifecycle and stale-upload cleanup use the
+  same lock.
+- Go 1.27.4 includes the standard library fixes for GO-2026-6859 (`net/http`
+  `MaxBytesReader` race that could crash the server) and GO-2026-6809
+  (`crypto/x509`).
+
 ## [1.3.0] - 2026-10-11
 
 ### Added
@@ -141,7 +242,8 @@ Nothing yet.
 
 See the [GitHub releases](https://github.com/onaonbir/Cloodsy-S3/releases).
 
-[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.3.0...HEAD
+[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.4.0...HEAD
+[1.4.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.1.2...v1.2.0
 [1.1.2]: https://github.com/onaonbir/Cloodsy-S3/releases/tag/v1.1.2
