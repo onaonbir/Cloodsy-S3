@@ -1,5 +1,10 @@
 <div align="center">
 
+<picture>
+  <source media="(prefers-color-scheme: dark)" srcset="docs/brand/logo-dark.svg">
+  <img src="docs/brand/logo-light.svg" alt="Cloodsy S3" height="64">
+</picture>
+
 # Cloodsy S3
 
 **A lightweight, AWS SDK-compatible S3 server written in Go.**
