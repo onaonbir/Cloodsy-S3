@@ -38,6 +38,8 @@ server:
       directory_url: ""           # Override the CA, e.g. Let's Encrypt staging while testing
       http_listen: ":80"          # HTTP-01 challenge + http->https redirect listener; "" = TLS-ALPN-01 only
   cors_origins: []                # Browser origins allowed to call the S3 API, e.g. ["https://app.example.com"].
+                                  # "https://*.example.com" matches any subdomain (not the apex) with the same
+                                  # scheme and port; "*" allows every origin.
                                   # Empty = no CORS headers are sent (browser clients will fail preflight).
   virtual_host_domains: []        # Enable virtual-hosted-style requests: with ["s3.example.com"] a request
                                   # to "photos.s3.example.com" is treated as bucket "photos".

@@ -43,7 +43,7 @@ All metadata is stored in an embedded SQLite database.
 - **Image Optimization on Upload** — Automatically generate a smaller optimized variant alongside each uploaded image (small images inline, large ones in the background); the original is preserved
 - **WebDAV Mounting** — Mount a bucket as a network drive over WebDAV (per-bucket opt-in, Basic Auth maps to bucket credentials)
 - **Admin REST API** — Full management API with session-based authentication for GUI/automation: object upload/download (multipart, resumable), copy/move, search, versions, metadata, lifecycle and webhook management, sessions, logs, metrics and a disk consistency scan. Pairs with [Cloodsy S3 GUI](https://github.com/onaonbir/Cloodsy-S3-GUI)
-- **CORS Support** — Browser-based S3 clients work once you list their origins in `server.cors_origins`
+- **CORS Support** — Browser-based S3 clients work once you list their origins in `server.cors_origins`: exact origins, subdomain wildcards such as `https://*.example.com`, or `*`
 - **TLS Support** — Optional HTTPS for the S3 API, the Admin API and WebDAV (each listener can carry its own certificate)
 - **Virtual-Host Addressing** — Optional `<bucket>.<domain>` style requests via `server.virtual_host_domains`
 - **Verified Uploads** — `Content-MD5`, `x-amz-content-sha256`, `x-amz-checksum-*` and `aws-chunked` chunk signatures are checked, so corrupt or tampered uploads are rejected
@@ -584,7 +584,7 @@ server:
       email: ""
       accept_tos: false
       http_listen: ":80"
-  cors_origins: []                  # browser origins allowed on the S3 API (empty = no CORS headers)
+  cors_origins: []                  # browser origins allowed on the S3 API: exact, "https://*.example.com" or "*" (empty = no CORS headers)
   virtual_host_domains: []          # ["s3.example.com"] enables <bucket>.s3.example.com addressing
   max_connections: 0                # 0 = unlimited
   idle_timeout: "60s"               # per-request stall timeout; large transfers are not capped
@@ -870,7 +870,7 @@ Uploaded files are stored on disk with a `.cloodsys3ext` extension to prevent ac
 - **Session tokens** — 8-hour TTL by default (`admin.session_ttl`), in-memory only, cleared on restart
 - **Login rate limiting** — Per client IP; `X-Forwarded-For` is only honored from `admin.trusted_proxies`
 - **Upload integrity** — `Content-MD5`, `x-amz-content-sha256`, `x-amz-checksum-*` and aws-chunked chunk signatures are verified; `server.require_payload_signature` rejects unsigned payloads
-- **CORS** — Off unless origins are listed in `server.cors_origins` / `admin.cors_origins`
+- **CORS** — Off unless origins are listed in `server.cors_origins` / `admin.cors_origins`; a subdomain wildcard (`https://*.example.com`) matches subdomains only, with the same scheme and port
 - **Self-update** — Release archives are verified against `checksums.txt` before installation; disable the start-up check with `update.check_on_start: false`
 - **Reporting** — See [SECURITY.md](SECURITY.md) for the disclosure policy and supported versions
 

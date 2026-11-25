@@ -703,12 +703,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 }
 
 func (h *Handler) corsAllowed(origin string) bool {
-	for _, o := range h.Config.Admin.CORSOrigins {
-		if o == "*" || o == origin {
-			return true
-		}
-	}
-	return false
+	return config.OriginAllowed(h.Config.Admin.CORSOrigins, origin)
 }
 
 func extractToken(r *http.Request) string {

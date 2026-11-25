@@ -395,3 +395,22 @@ func TestCORSPreflightForUpload(t *testing.T) {
 		t.Fatalf("expose headers: %q", rec.Header().Get("Access-Control-Expose-Headers"))
 	}
 }
+
+func TestCORSWildcardOrigin(t *testing.T) {
+	h := newTestHandler(t, nil)
+	h.Config.Admin.CORSOrigins = []string{"https://*.gui.example"}
+	for origin, want := range map[string]string{
+		"https://team.gui.example": "https://team.gui.example",
+		"https://gui.example":      "",
+		"https://evil.example":     "",
+	} {
+		req := httptest.NewRequest(http.MethodOptions, "/admin/status", nil)
+		req.Header.Set("Origin", origin)
+		req.Header.Set("Access-Control-Request-Method", "GET")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if got := rec.Header().Get("Access-Control-Allow-Origin"); got != want {
+			t.Errorf("%s: Allow-Origin %q, want %q", origin, got, want)
+		}
+	}
+}

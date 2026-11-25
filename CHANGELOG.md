@@ -8,6 +8,22 @@ All notable changes to Cloodsy S3 are documented here. The format follows
 
 Nothing yet.
 
+## [1.5.0] - 2026-11-25
+
+### Added
+
+- **Wildcard CORS origins**: `server.cors_origins` and `admin.cors_origins`
+  accept subdomain wildcards such as `https://*.example.com`, for web apps
+  that serve each workspace or tenant on its own subdomain. The `*` stands for
+  one or more subdomain labels; the apex (`https://example.com`) needs its own
+  entry, and scheme and port must match. A malformed wildcard
+  (`*.example.com`, `https://a.*.example.com`) stops the server at start-up
+  instead of silently blocking browsers.
+
+### Changed
+
+- Admin API origins are compared case-insensitively, like the S3 API.
+
 ## [1.4.0] - 2026-11-14
 
 ### Added
@@ -242,7 +258,8 @@ detect what a server supports.
 
 See the [GitHub releases](https://github.com/onaonbir/Cloodsy-S3/releases).
 
-[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.4.0...HEAD
+[Unreleased]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.4.0...v1.5.0
 [1.4.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.2.0...v1.3.0
 [1.2.0]: https://github.com/onaonbir/Cloodsy-S3/compare/v1.1.2...v1.2.0

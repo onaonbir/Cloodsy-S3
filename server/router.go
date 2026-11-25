@@ -8,6 +8,7 @@ import (
 	"strings"
 
 	"github.com/google/uuid"
+	"github.com/onaonbir/Cloodsy-S3/config"
 	"github.com/onaonbir/Cloodsy-S3/handler"
 	"github.com/onaonbir/Cloodsy-S3/httpx"
 	"github.com/onaonbir/Cloodsy-S3/s3err"
@@ -87,14 +88,7 @@ func (sr *s3Router) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 
 	// CORS support — only for configured origins
 	if origin := r.Header.Get("Origin"); origin != "" {
-		allowed := false
-		for _, o := range sr.handler.Config.Server.CORSOrigins {
-			if o == "*" || strings.EqualFold(o, origin) {
-				allowed = true
-				break
-			}
-		}
-		if allowed {
+		if config.OriginAllowed(sr.handler.Config.Server.CORSOrigins, origin) {
 			w.Header().Set("Access-Control-Allow-Origin", origin)
 			w.Header().Add("Vary", "Origin")
 			w.Header().Set("Access-Control-Allow-Methods", "GET, PUT, POST, DELETE, HEAD, OPTIONS")

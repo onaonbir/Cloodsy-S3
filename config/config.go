@@ -408,6 +408,12 @@ func (cfg *Config) Validate() error {
 	if cfg.Server.MaxConnections < 0 {
 		return fmt.Errorf("server.max_connections must be >= 0")
 	}
+	if err := validateCORSOrigins("server.cors_origins", cfg.Server.CORSOrigins); err != nil {
+		return err
+	}
+	if err := validateCORSOrigins("admin.cors_origins", cfg.Admin.CORSOrigins); err != nil {
+		return err
+	}
 	return nil
 }
 
